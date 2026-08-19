@@ -668,17 +668,46 @@ static void offlineSummaryLoop() {
 //  §3.9 Flush buffer offline
 // ═══════════════════════════════════════════════════════════════
 
+/* Dua jeda, dan keduanya wajib.
+ *
+ * flushLoop() dipanggil dari loop() tanpa timer, jadi ia berjalan ribuan
+ * kali per detik. Tanpa jeda pertama, 256 entri dilempar sebagai ~22 notify
+ * berturut-turut dalam hitungan mikrodetik; kolam mbuf NimBLE habis, notify
+ * mulai gagal tanpa suara, dan sebagian malam yang tersimpan hilang justru
+ * pada saat ia sedang diselamatkan. Satu paket per interval koneksi.
+ *
+ * Jeda kedua lebih parah kalau diabaikan. flushing_ baru turun di ack(),
+ * jadi begitu paketnya habis, sentinel dikirim ulang di SETIAP putaran loop
+ * sampai ACK pulang — ribuan sentinel untuk satu jabat tangan, dan aplikasi
+ * membalas satu tulis ACK untuk tiap-tiapnya. Badai dua arah yang cukup
+ * untuk menjatuhkan sambungan.
+ *
+ * Tetap diulang, hanya jarang: sentinel yang hilang tidak boleh membuat
+ * gelang menunggu selamanya dengan buffer yang tak pernah dihapus. */
+#define FLUSH_PACKET_GAP_MS           30
+#define FLUSH_SENTINEL_RETRY_MS     2000
+
 static void flushLoop() {
-    if (!offline.flushing()) return;
-    if (!BLE_Connected()) { offline.abortFlush(); return; }
+    static uint32_t lastPacketMs   = 0;
+    static uint32_t lastSentinelMs = 0;
+
+    if (!offline.flushing()) { lastSentinelMs = 0; return; }
+    if (!BLE_Connected())    { offline.abortFlush(); lastSentinelMs = 0; return; }
 
     uint8_t  packet[3 + EVTBUF_PER_PACKET * EVTBUF_ENTRY_LEN];
     uint16_t len = 0;
+
+    if (millis() - lastPacketMs < FLUSH_PACKET_GAP_MS) return;
+
     if (offline.nextPacket(packet, &len)) {
+        lastPacketMs = millis();
         BLE_NotifyBuffer(packet, len);
         return;
     }
+
     // Habis. Tutup dengan sentinel dan tunggu ACK — buffer belum dihapus.
+    if (lastSentinelMs != 0 && millis() - lastSentinelMs < FLUSH_SENTINEL_RETRY_MS) return;
+    lastSentinelMs = millis();
     len = EventBuffer::sentinel(packet);
     BLE_NotifyBuffer(packet, len);
 }
