@@ -1,0 +1,6 @@
+# Keluaran arduino-cli dan uji host. Sumbernya yang disimpan, bukan hasilnya.
+build/
+*.exe
+*.elf
+*.bin
+*.map
