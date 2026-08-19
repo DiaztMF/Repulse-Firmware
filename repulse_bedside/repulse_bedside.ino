@@ -180,6 +180,13 @@ static void lightSet(const char *mode, uint16_t kelvin, uint8_t brightness, uint
 
 static void lightLoop() {
     if (lightRampMs == 0) return;
+    /* Darurat memiliki strip, tanpa berbagi. Peredupan sunset berjalan 25
+     * menit, jadi anomali di tengahnya menemukan ramp yang masih hidup —
+     * dan keduanya menulis strip yang sama. lightLoop menyala tiap 40 ms,
+     * kedipan darurat tiap 400 ms, jadi yang menang adalah yang meredup:
+     * kedipan putih §PRD 6.3 menyusut jadi kedipan 40 ms sekali sedetik,
+     * nyaris tak terlihat, tepat pada saat ia paling harus terlihat. */
+    if (sirenOn) return;
     static uint32_t lastPaintMs = 0;
     if (millis() - lastPaintMs < LIGHT_REFRESH_MS) return;
     lastPaintMs = millis();
@@ -447,7 +454,11 @@ static void roomLoop() {
 
 void setup() {
     Serial.begin(115200);
-    delay(300);
+    /* Sama seperti di gelang: port USB-CDC baru muncul di PC satu sampai
+     * dua detik setelah reset, jadi delay(300) membuang seluruh banner boot
+     * — termasuk baris TIDAK DITEMUKAN yang justru paling ingin kamu baca
+     * saat menelusuri sensor yang belum terpasang. */
+    for (uint32_t t0 = millis(); !Serial && millis() - t0 < 2000; ) delay(10);
     Serial.println(F("\n=== RePulse Bedside (ESP32-C3) ==="));
 
     if (PIN_AROMA >= 0) {
