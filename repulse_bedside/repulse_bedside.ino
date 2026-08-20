@@ -480,7 +480,27 @@ void setup() {
     dht.begin();
 
     DfSerial.begin(9600, SERIAL_8N1, PIN_DFPLAYER_RX, PIN_DFPLAYER_TX);
+
+    /* Dua percobaan, karena "tidak menjawab" dan "tidak ada" bukan hal yang
+     * sama.
+     *
+     * begin(..., isACK, doReset) mengirim perintah reset lalu menunggu
+     * balasannya. Klon DFPlayer yang beredar — MH2024K, GD3200B — sering
+     * tidak pernah membalas reset meski memutar berkas dengan sempurna,
+     * dan dengan isACK menyala kegagalan itu jadi mutlak: modul sehat
+     * dilaporkan hilang, dan sirene tidak akan pernah berbunyi.
+     *
+     * Percobaan kedua mematikan keduanya. Harganya nyata — tanpa ACK kita
+     * tidak lagi tahu apakah sebuah perintah benar-benar diterima — jadi
+     * ia hanya dipakai setelah cara yang jujur gagal, dan log mengatakan
+     * mana yang berhasil supaya tidak ada yang salah menduga. */
     dfReady = dfplayer.begin(DfSerial, /*isACK=*/true, /*doReset=*/true);
+    if (!dfReady) {
+        Serial.println(F("[DFPLAYER] tidak membalas reset — coba tanpa ACK"));
+        delay(200);
+        dfReady = dfplayer.begin(DfSerial, /*isACK=*/false, /*doReset=*/false);
+        if (dfReady) Serial.println(F("[DFPLAYER] menjawab tanpa ACK — perintah tidak dikonfirmasi"));
+    }
     Serial.printf("[DFPLAYER] %s\n", dfReady ? "OK" : "TIDAK DITEMUKAN");
     if (dfReady) dfplayer.volume(20);
 

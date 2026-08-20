@@ -130,13 +130,24 @@ void BLE_Init(const BedsideCallbacks &cb) {
     NimBLEDevice::startAdvertising();
 
     /* Active scan boleh — bedside tersambung listrik, jadi biaya dayanya
-     * tidak jadi soal (§2.1). Jendela penuh supaya jeda antara tahap berubah
-     * dan bedside tahu tetap jauh di bawah 2 detik. */
+     * tidak jadi soal (§2.1).
+     *
+     * Tapi jendelanya TIDAK boleh penuh, dan itu pelajaran mahal. Window 99
+     * dari interval 100 berarti radio mendengarkan 99% waktu — dan satu radio
+     * BLE tidak bisa memindai sambil mengiklan, keduanya memakai pemancar
+     * yang sama. Bedside jadi mengumumkan dirinya hanya di 1% sisa waktu,
+     * dan HP tidak pernah kebetulan menyimak di celah sekecil itu. Perangkat
+     * yang sehat, mengiklan sesuai log, dan tak terlihat oleh siapa pun.
+     *
+     * Setengah jendela menyisakan separuh waktu untuk iklan. Deteksi tahap
+     * eskalasi tetap jauh di bawah batas 2 detik §2.1: gelang menyiarkan
+     * berkali-kali per detik, jadi kehilangan separuhnya hanya menggandakan
+     * waktu tunggu rata-rata dari milidetik ke milidetik. */
     g_scan = NimBLEDevice::getScan();
     g_scan->setScanCallbacks(new ScanCallbacks(), false);
     g_scan->setActiveScan(true);
-    g_scan->setInterval(100);
-    g_scan->setWindow(99);
+    g_scan->setInterval(160);            // 100 ms
+    g_scan->setWindow(80);               // 50 ms mendengar, 50 ms bebas mengiklan
     g_scan->start(0, false, true);
 
     Serial.println("[BLE] Advertising as RePulse Bedside, memindai gelang");
