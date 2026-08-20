@@ -77,9 +77,20 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 static NimBLEScan *g_scan = nullptr;
 
 void BLE_ScanLoop() {
-    if (g_scan && !g_scan->isScanning()) {
-        g_scan->start(0, false, true);       // 0 = terus-menerus
-    }
+    /* Dijeda, dan itu bukan kerapian.
+     *
+     * loop() memanggil ini ribuan kali per detik. isScanning() sesaat false
+     * setiap kali pengontrol menyerahkan radio untuk mengirim satu paket
+     * iklan — dan tanpa jeda, panggilan berikutnya langsung merebutnya
+     * kembali. Iklan yang baru mulai dipotong sebelum sempat mengudara,
+     * berulang-ulang, sehingga perangkat yang sehat tidak pernah terlihat
+     * siapa pun. Setengah detik sudah jauh lebih cepat daripada yang bisa
+     * dirasakan §2.1. */
+    static uint32_t lastRestartMs = 0;
+    if (!g_scan || g_scan->isScanning()) return;
+    if (millis() - lastRestartMs < 500) return;
+    lastRestartMs = millis();
+    g_scan->start(0, false, true);           // 0 = terus-menerus
 }
 
 bool BLE_HasPairedBand() { return !g_paired_mac.isEmpty(); }
@@ -150,7 +161,10 @@ void BLE_Init(const BedsideCallbacks &cb) {
     g_scan->setWindow(80);               // 50 ms mendengar, 50 ms bebas mengiklan
     g_scan->start(0, false, true);
 
-    Serial.println("[BLE] Advertising as RePulse Bedside, memindai gelang");
+    /* Tanggal build, supaya "sudah kau flash belum?" berhenti jadi
+     * pertanyaan yang tidak bisa dijawab siapa pun dari log. */
+    Serial.printf("[BLE] Advertising as RePulse Bedside, memindai gelang (build %s %s)\n",
+                  __DATE__, __TIME__);
 }
 
 bool BLE_Connected() { return g_connected; }
