@@ -94,7 +94,16 @@
  * di snore.h tidak berarti apa-apa. */
 #define MIC_DB_OFFSET         26.0f
 
-#define ROOM_INTERVAL_MS   60000    // §4.1 lux tiap 1 menit
+/* §4.1 menyebut "lux tiap 1 menit". Itu batas BAWAH kesegaran untuk satu
+ * malam, bukan batas atas laju — dan sepuluh detik bukan biaya bagi
+ * perangkat yang dicolok ke listrik.
+ *
+ * Satu menit membuat sensor mustahil diperiksa. Orang menutup BH1750
+ * dengan telapak tangan, menatap layar, tidak terjadi apa-apa, lalu
+ * menyimpulkan sensornya mati — padahal ia hanya belum waktunya bicara.
+ * Sensor sehat yang tampak rusak selama lima puluh sembilan detik adalah
+ * kesalahan yang jauh lebih mahal daripada lima notify tambahan per menit. */
+#define ROOM_INTERVAL_MS   10000    // §4.1 minimum 1 menit; ini lebih rapat
 #define DHT_INTERVAL_MS   300000    // §4.1 suhu/RH tiap 5 menit
 #define SNORE_FEED_MS        100    // amplop ~10 Hz
 
@@ -370,21 +379,33 @@ static void onBandSeen(uint8_t stage, bool phone_connected, bool paired) {
 //  Mikrofon — §4.2 dengkuran, dan dB untuk §4.1
 // ═══════════════════════════════════════════════════════════════
 
-/* DMA I2S harus dikuras setiap loop, bukan sekali per 100 ms. Membaca satu
- * blok tiap 100 ms berarti 84% audio menumpuk di buffer sampai meluap, dan
- * yang terbaca justru suara 100 ms yang lalu — amplop dengkuran jadi mundur
- * dan tidak beraturan. Jadi: kuras terus, dan yang dilaporkan ke detektor
- * adalah PUNCAK selama jendela 100 ms, karena §4.2 mencari puncak berulang,
- * bukan rata-rata. */
+/* SATU blok per putaran loop, dan sengaja TIDAK memakai i2s.available().
+ *
+ * available() di core ESP32 3.x tidak melaporkan isi buffer sama sekali —
+ * ia mengembalikan konstanta I2S_READ_CHUNK_SIZE (1920). Blok kita 1024
+ * byte, jadi `while (i2s.available() >= sizeof(block))` berbunyi
+ * `while (1920 >= 1024)`: tidak pernah salah, tidak pernah selesai. Dan
+ * readBytes memblokir sampai satu blok penuh terkumpul, jadi loop() tidak
+ * pernah keluar dari fungsi ini sejak boot. Semua yang berada di bawahnya
+ * — roomLoop, lightLoop, aromaLoop, alertFlashLoop, BLE_ScanLoop — belum
+ * pernah berjalan satu kali pun. Tidak ada [ROOM], tidak ada [SNORE], lampu
+ * tidak pernah meredup, gelang tidak pernah terlihat. Satu baris while
+ * mematikan seluruh separuh perangkat, dan sisanya tetap terlihat sehat
+ * karena BLE berjalan di task NimBLE sendiri.
+ *
+ * Satu blok 256 sampel pada 16 kHz adalah 16 ms audio, jadi membaca satu
+ * blok per putaran memacu loop() pada laju mikrofon itu sendiri — cukup
+ * sering untuk semua yang lain, dan tidak tertinggal selama sisa loop
+ * lebih ringan dari 16 ms. Yang dilaporkan ke detektor tetap PUNCAK
+ * selama jendela 100 ms, karena §4.2 mencari puncak berulang, bukan
+ * rata-rata. */
 static void micLoop() {
     if (!micReady) return;
 
     static int32_t block[MIC_BLOCK_SAMPLES];
     static uint8_t windowPeakDb = 0;
 
-    while (i2s.available() >= (int)sizeof(block)) {
-        if (i2s.readBytes((char *)block, sizeof(block)) < sizeof(block)) break;
-
+    if (i2s.readBytes((char *)block, sizeof(block)) == sizeof(block)) {
         // INMP441 mengirim 24 bit yang rata kiri di dalam slot 32 bit.
         double sum_sq = 0;
         for (size_t i = 0; i < MIC_BLOCK_SAMPLES; i++) {
