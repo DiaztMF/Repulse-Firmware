@@ -115,9 +115,15 @@ Device-side code for RePulse, a sleep and heart monitoring system built for Indo
 
    | Band (C3) | | Watch (S3) |
    |---|---|---|
-   | GPIO 7 — `PIN_S3_TX` | → | GPIO 44 — `PIN_BAND_RX` |
-   | GPIO 6 — `PIN_S3_RX` | ← | GPIO 43 — `PIN_BAND_TX` |
+   | GPIO 7 — `PIN_UART_OUT` | → | GPIO 44 — `PIN_BAND_RX` |
+   | GPIO 6 — `PIN_UART_IN` | ← | GPIO 43 — `PIN_BAND_TX` — optional, see below |
    | GND | — | GND |
+
+   Only the first line carries anything. `Repulse_Link.cpp` reads and never
+   writes — the watch draws, it does not answer — so GPIO 6 and GPIO 43 can
+   be left unconnected. One signal wire also makes the mistake that pairing
+   costs a GPIO impossible: two push-pull drivers cannot fight over a node
+   that only one of them is on.
 
 ## Configuration
 
@@ -132,7 +138,7 @@ Firmware has no `.env`; these are the compile-time constants that must match you
 | `PIN_MOTOR` | Vibration motor, PWM via LEDC | `1` | Yes |
 | `PIN_ECG_OUT` | AD8232 analog output, must be ADC1. `-1` disables the ECG characteristic | `-1` | No — not fitted |
 | `PIN_ECG_LO_P` / `PIN_ECG_LO_N` | AD8232 lead-off detect, drives `lead_on` | `-1` / `-1` | No — not fitted |
-| `PIN_S3_TX` / `PIN_S3_RX` | UART1 to the watch. Not UART0 — that carries the USB log | `7` / `6` | Yes |
+| `PIN_UART_OUT` / `PIN_UART_IN` | UART1 to the watch, named from this board's own point of view rather than the far one. Not UART0 — that carries the USB log | `7` / `6` | Out yes, in optional |
 | `PIN_BATTERY_ADC` | Battery divider. `-1` reports `255` — contract §3.6 for "not measured" — instead of inventing a number | `-1` | No — not fitted |
 | `IR_WORN_THRESHOLD` | Infrared DC level separating "on a wrist" from "on a table" | `100000` | Measured 19 Aug 2026 at full LED current: bare table 27–29 k, wrist skin 206–246 k. Re-measure on darker skin |
 

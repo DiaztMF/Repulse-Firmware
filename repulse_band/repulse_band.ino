@@ -63,9 +63,23 @@
 #define PIN_ECG_LO_P       -1
 #define PIN_ECG_LO_N       -1
 
-// UART ke layar ESP32-S3. Bukan UART0 — Serial dipakai untuk log USB.
-#define PIN_S3_TX           7
-#define PIN_S3_RX           6
+/* UART ke layar ESP32-S3. Bukan UART0 — Serial dipakai untuk log USB.
+ *
+ * Dinamai dari sudut pandang pin ini sendiri, bukan dari lawan bicaranya.
+ * Nama lama menyebut papan seberang, dan itu bisa dibaca dua cara — "pin
+ * tempat kami mengirim ke sana", atau "pin pengirim milik sana tersambung
+ * ke sini". Kedua bacaan menghasilkan penyolderan yang berlawanan.
+ *
+ * Yang menentukan tetap urutan argumen begin(baud, config, rxPin, txPin),
+ * bukan namanya. Nama ini hanya berhenti berdebat dengannya:
+ *
+ *     GPIO7  keluar  ──→  GPIO44 (RX) di S3
+ *     GPIO6  masuk   ←──  GPIO43 (TX) di S3, tidak terpakai hari ini
+ *
+ * Jalur kedua boleh dibiarkan menggantung: Repulse_Link.cpp hanya membaca,
+ * tidak pernah menulis. Jam menggambar, ia tidak menjawab. */
+#define PIN_UART_OUT        7    // C3 mengirim
+#define PIN_UART_IN         6    // C3 menerima
 
 // Pembagi tegangan baterai. -1 = belum ada; status melaporkan 255 —
 // "tidak diketahui" menurut §3.6 — dan memperingatkan sekali di log
@@ -891,7 +905,7 @@ void setup() {
     for (uint32_t t0 = millis(); !Serial && millis() - t0 < 2000; ) delay(10);
     Serial.println(F("\n=== RePulse Band (ESP32-C3) ==="));
 
-    S3.begin(S3_BAUD, SERIAL_8N1, PIN_S3_RX, PIN_S3_TX);
+    S3.begin(S3_BAUD, SERIAL_8N1, PIN_UART_IN, PIN_UART_OUT);
 
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(PIN_BUTTON), buttonISR, CHANGE);
