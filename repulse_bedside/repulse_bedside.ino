@@ -11,7 +11,7 @@
  *
  *  Sensor  : BH1750 (lux), DHT11 (suhu/RH), INMP441 (mikrofon I2S)
  *  Aktuator: WS2812 (lampu), DFPlayer Mini (white noise + sirene),
- *            diffuser aroma BELUM punya pin kendali (lihat PIN_AROMA)
+ *            diffuser aroma lewat modul relay di GPIO20 (lihat PIN_AROMA)
  *
  *  Library (Arduino Library Manager):
  *    1. NimBLE-Arduino  >= 2.0   — h2zero
@@ -43,8 +43,14 @@
 //  PIN — sesuai tabel wiring bedside
 // ═══════════════════════════════════════════════════════════════
 
-#define PIN_MIC_BCLK       4    // INMP441 SCK
-#define PIN_MIC_WS         5    // INMP441 WS / LRCK
+/* Mengikuti rangkaian yang sudah terpasang, bukan sebaliknya. Sempat
+ * tertukar terhadap firmware — INMP441 menerima aba-aba frame di kaki
+ * clock-nya dan detak di kaki frame-nya, jadi ia tidak pernah mengeluarkan
+ * satu bit sah pun. Gejalanya nol mutlak di setiap sampel, sama persis
+ * dengan kabel putus, dan keempat pemeriksaan kabel lolos karena memang
+ * semuanya tersambung — hanya ke lubang yang salah. */
+#define PIN_MIC_BCLK       5    // INMP441 SCK
+#define PIN_MIC_WS         4    // INMP441 WS / LRCK
 #define PIN_MIC_DIN        6    // INMP441 SD / DOUT
 
 #define PIN_I2C_SCL        7    // BH1750
@@ -65,10 +71,29 @@
  * ruangan jadi lembap dan berisiko mengiritasi saluran napas. Selama belum
  * ada MOSFET/relay, cabut diffusernya saat tidur.
  *
- * Untuk mengaktifkan nanti: isi pin ini (GPIO21 kalau pad 20/21 keluar, atau
- * GPIO1 menggantikan modul LM393 yang tidak dipakai firmware ini), lalu set
- * AROMA_ACTIVE_LEVEL — modul relay biasanya aktif LOW, MOSFET aktif HIGH. */
-#define PIN_AROMA         -1
+ * Sekarang ADA: modul relay di GPIO20.
+ *
+ * ⚠ GPIO20 adalah U0RXD — kaki RX UART0 bawaan ESP32-C3. Aman dipakai di
+ * sini hanya karena CDCOnBoot=cdc memindahkan Serial ke USB, jadi UART0
+ * tidak dipakai untuk log. Tapi ROM bootloader tetap menyentuh pasangan
+ * 20/21 sesaat setelah reset, dan di jendela itu pin kita belum jadi
+ * OUTPUT — ia mengambang. Modul relay aktif-LOW membaca kaki mengambang
+ * sebagai LOW dan menyalakan diffuser di setiap boot. Karena itu level
+ * mati DITULIS SEBELUM pinMode() di setup(), supaya latch keluarannya
+ * sudah benar pada detik pin itu menjadi keluaran.
+ *
+ * AROMA_ACTIVE_LEVEL — DIUKUR, bukan diasumsikan. Modul relay yang beredar
+ * kebanyakan aktif LOW dan itulah yang kutebak semula; modul di meja ini
+ * ternyata aktif HIGH. Gejalanya tegas dan tidak bisa disalahartikan:
+ * relay menyala saat boot, lalu MATI ketika perintah aroma dikirim — tepat
+ * kebalikan dari yang seharusnya.
+ *
+ * Kalau kelak modulnya diganti dan gejala itu muncul lagi, baliklah define
+ * ini dan tidak ada lagi yang perlu disentuh. Salah polaritas di sini bukan
+ * ketidaknyamanan: §4.3 melarang diffuser menyala terus-menerus karena
+ * risikonya nyata bagi penderita asma, dan polaritas terbalik berarti
+ * diffuser menyala sepanjang malam kecuali seseorang memerintahkannya. */
+#define PIN_AROMA         20
 #define AROMA_ACTIVE_LEVEL HIGH
 
 /* ⚠ CATATAN STRAPPING PIN ESP32-C3: GPIO2, GPIO8, dan GPIO9 ikut menentukan
@@ -89,10 +114,29 @@
 
 #define MIC_SAMPLE_RATE    16000
 #define MIC_BLOCK_SAMPLES    256
-/* Offset kalibrasi dB. Ukur dengan aplikasi sound-meter di HP di kamar
- * sungguhan lalu geser angka ini sampai cocok. Tanpa ini, ambang dengkuran
- * di snore.h tidak berarti apa-apa. */
-#define MIC_DB_OFFSET         26.0f
+/* Offset kalibrasi dB — diturunkan dari lembar data INMP441, bukan ditebak.
+ *
+ * Sensitivitas INMP441: −26 dBFS pada 94 dB SPL. Jadi:
+ *     SPL = dBFS + 120
+ *
+ * Skala penuh jalur kita: sampel 24 bit rata-kiri di dalam 32 bit, lalu
+ * digeser >>14, sehingga puncak skala penuh = 2^31 / 2^14 = 131072. Karena
+ * dBFS mengacu pada sinus skala penuh, RMS-nya = 131072 / √2 = 92682.
+ *
+ *     dBFS(rms) = 20·log10(rms / 92682)
+ *     SPL       = 20·log10(rms) − 99,34 + 120
+ *               = 20·log10(rms) + 20,66
+ *
+ * Angka 26,0 yang lama tidak berasal dari mana pun — aku mengarangnya di
+ * meja. Yang ini bisa ditelusuri sampai ke lembar data, dan kalau kelak
+ * ada yang mengukurnya dengan sound meter, selisihnya akan kecil dan
+ * bermakna alih-alih membetulkan tebakan dengan tebakan lain.
+ *
+ * Sisa biasnya jujur disebut di sini: yang dilaporkan adalah PUNCAK RMS
+ * 16 ms selama jendela 100 ms, sedangkan sound meter menampilkan rata-rata
+ * lambat. Di ruangan berdenyut bacaan kita akan beberapa dB di atasnya —
+ * dan itu memang yang diminta §4.2, yang mencari puncak berulang. */
+#define MIC_DB_OFFSET         20.66f
 
 /* §4.1 menyebut "lux tiap 1 menit". Itu batas BAWAH kesegaran untuk satu
  * malam, bukan batas atas laju — dan sepuluh detik bukan biaya bagi
@@ -102,8 +146,13 @@
  * dengan telapak tangan, menatap layar, tidak terjadi apa-apa, lalu
  * menyimpulkan sensornya mati — padahal ia hanya belum waktunya bicara.
  * Sensor sehat yang tampak rusak selama lima puluh sembilan detik adalah
- * kesalahan yang jauh lebih mahal daripada lima notify tambahan per menit. */
-#define ROOM_INTERVAL_MS   10000    // §4.1 minimum 1 menit; ini lebih rapat
+ * kesalahan yang jauh lebih mahal daripada notify tambahan per menit.
+ *
+ * Lima detik, bukan sepuluh: pada sepuluh detik, menutup sensor lalu
+ * melihat layar masih terasa seperti menunggu jawaban yang tidak datang.
+ * Dua belas notify per menit tetap tidak berarti apa-apa bagi perangkat
+ * yang dicolok ke listrik. */
+#define ROOM_INTERVAL_MS    5000    // §4.1 minimum 1 menit; ini jauh lebih rapat
 #define DHT_INTERVAL_MS   300000    // §4.1 suhu/RH tiap 5 menit
 #define SNORE_FEED_MS        100    // amplop ~10 Hz
 
@@ -159,6 +208,9 @@ static bool lastSnoreFlag = false;
 
 // Tempo
 static uint32_t lastRoomMs = 0, lastDhtMs = 0, lastSnoreFeedMs = 0;
+/* Hanya untuk mendiagnosis mikrofon — dicetak lalu dinolkan tiap [ROOM]. */
+static uint32_t micBlocks = 0, micShort = 0;
+static int32_t  micRawPeak = 0;
 static uint32_t lastBandSeenMs = 0;
 
 // ═══════════════════════════════════════════════════════════════
@@ -229,6 +281,147 @@ static void alertFlashLoop() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  White noise — §4.4 fade_s
+// ═══════════════════════════════════════════════════════════════
+/* Aplikasi mengirim fade_s di setiap perintah white noise, dan firmware
+ * membuangnya — suara muncul penuh di ketukan pertama. Untuk perangkat yang
+ * dinyalakan tepat ketika seseorang mulai terlelap, itu bukan detail kosmetik:
+ * bunyi yang datang seketika pada volume 20 justru membangunkan orang yang
+ * hendak ditenangkannya.
+ *
+ * Volume DFPlayer adalah perintah serial 9600 baud, jadi ia tidak boleh
+ * ditulis tiap putaran loop. Satu langkah tiap 200 ms sudah lebih halus
+ * daripada yang bisa didengar telinga pada tangga 0–30, dan fade 30 detik
+ * hanya menjadi tiga puluh penulisan. */
+
+#define NOISE_STEP_MS   200
+
+static bool     noiseOn        = false;
+static uint8_t  noiseCurVol    = 0;     // volume yang benar-benar ada di modul
+static uint8_t  noiseTargetVol = 0;
+static uint8_t  noiseFromVol   = 0;
+static uint32_t noiseFadeMs    = 0;     // 0 = tidak ada fade berjalan
+static uint32_t noiseFadeStart = 0;
+static bool     noiseStopAtEnd = false;
+
+/* DFPlayer bicara meski tidak menjawab ACK.
+ *
+ * Klon yang mengabaikan reset tetap mengirim pesan tak diminta lewat TX-nya:
+ * kartu terpasang, trek selesai, dan — yang paling berharga saat tidak ada
+ * bunyi — kode error. Firmware ini tidak pernah membacanya sekali pun, jadi
+ * "berkas tidak ditemukan" dan "speaker salah pasang" terlihat persis sama
+ * dari luar: sunyi.
+ *
+ * Dikuras tiap putaran loop dan dicetak apa adanya. Satu baris di serial
+ * lebih murah daripada satu jam membongkar kabel yang sudah benar. */
+static void dfLoop() {
+    if (!dfplayer.available()) return;
+
+    uint8_t type = dfplayer.readType();
+    int     val  = dfplayer.read();
+
+    switch (type) {
+        case DFPlayerCardOnline:   Serial.println(F("[DF] kartu SD terbaca")); break;
+        case DFPlayerCardInserted: Serial.println(F("[DF] kartu dimasukkan")); break;
+        case DFPlayerCardRemoved:  Serial.println(F("[DF] kartu DICABUT")); break;
+        case DFPlayerPlayFinished: Serial.printf("[DF] trek %d selesai" "\n", val); break;
+        case DFPlayerFeedBack:     Serial.printf("[DF] balasan %d" "\n", val); break;
+        case WrongStack:           Serial.println(F("[DF] paket rusak - periksa kabel TX/RX")); break;
+        case TimeOut:              Serial.println(F("[DF] tidak menjawab dalam waktunya")); break;
+        case DFPlayerError:
+            switch (val) {
+                case Busy:             Serial.println(F("[DF] ERROR: sibuk / kartu tidak ditemukan")); break;
+                case Sleeping:         Serial.println(F("[DF] ERROR: modul tidur")); break;
+                case SerialWrongStack: Serial.println(F("[DF] ERROR: paket serial salah")); break;
+                case CheckSumNotMatch: Serial.println(F("[DF] ERROR: checksum tidak cocok")); break;
+                case FileIndexOut:     Serial.println(F("[DF] ERROR: NOMOR TREK DI LUAR JANGKAUAN")); break;
+                case FileMismatch:     Serial.println(F("[DF] ERROR: BERKAS TIDAK DITEMUKAN")); break;
+                case Advertise:        Serial.println(F("[DF] ERROR: sedang memutar iklan")); break;
+                default:               Serial.printf("[DF] ERROR kode %d" "\n", val); break;
+            }
+            break;
+        default: Serial.printf("[DF] tipe %u nilai %d" "\n", type, val); break;
+    }
+}
+
+static void noiseApply(uint8_t vol) {
+    if (vol == noiseCurVol) return;
+    noiseCurVol = vol;
+    dfplayer.volume(vol);
+}
+
+/* Sirene merebut DFPlayer tanpa lewat sini, jadi setiap fade yang sedang
+ * berjalan harus dibatalkan — kalau tidak, langkah fade berikutnya akan
+ * menurunkan volume sirene di tengah keadaan darurat. */
+static void noiseCancel(uint8_t volNowOnModule) {
+    noiseOn        = false;
+    noiseFadeMs    = 0;
+    noiseStopAtEnd = false;
+    noiseCurVol    = volNowOnModule;
+    noiseTargetVol = volNowOnModule;
+}
+
+static void noiseSet(bool on, uint8_t level0_3, uint8_t track, uint16_t fade_s) {
+    if (!dfReady) return;
+    if (level0_3 > 3) level0_3 = 3;
+    uint8_t target = on ? (uint8_t)(level0_3 * 10) : 0;
+
+    if (on && !noiseOn) {
+        /* Mulai dari senyap, lalu naik. Menyalakan trek dulu pada volume
+         * lama berarti satu ketukan keras sebelum fade sempat mulai. */
+        noiseApply(0);
+        dfplayer.loop(TRACK_WHITE_NOISE_BASE + (track > 0 ? track : 1) - 1);
+    }
+
+    noiseOn        = on;
+    noiseStopAtEnd = !on;
+    noiseFromVol   = noiseCurVol;
+    noiseTargetVol = target;
+    noiseFadeStart = millis();
+    noiseFadeMs    = (uint32_t)fade_s * 1000UL;
+
+    /* fade_s = 0 berarti sekarang juga. Panel uji memakainya untuk
+     * mendengar tiap langkah volume tanpa menunggu setengah menit. */
+    if (noiseFadeMs == 0) {
+        noiseApply(target);
+        if (noiseStopAtEnd) dfplayer.stop();
+    }
+
+    Serial.printf("[NOISE] %s vol %u→%u fade %us\n",
+                  on ? "menyala" : "mati", noiseFromVol, target, fade_s);
+}
+
+static void noiseLoop() {
+    if (!dfReady || noiseFadeMs == 0) return;
+
+    static uint32_t lastStepMs = 0;
+    if (millis() - lastStepMs < NOISE_STEP_MS) return;
+    lastStepMs = millis();
+
+    uint32_t elapsed = millis() - noiseFadeStart;
+    uint8_t  vol;
+    if (elapsed >= noiseFadeMs) {
+        vol = noiseTargetVol;
+    } else {
+        int32_t span = (int32_t)noiseTargetVol - (int32_t)noiseFromVol;
+        vol = (uint8_t)((int32_t)noiseFromVol +
+                        span * (int32_t)elapsed / (int32_t)noiseFadeMs);
+    }
+    noiseApply(vol);
+
+    if (noiseCurVol == noiseTargetVol) {
+        noiseFadeMs = 0;
+        /* Baru berhenti setelah senyap. Memanggil stop() saat perintah
+         * datang akan memotong fade turun sebelum bunyi pertama meredup. */
+        if (noiseStopAtEnd) {
+            dfplayer.stop();
+            noiseStopAtEnd = false;
+            Serial.println("[NOISE] senyap, trek berhenti");
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Sirene — tidak punya pin sendiri
 // ═══════════════════════════════════════════════════════════════
 /* Sirene diperankan DFPlayer pada volume maksimum ditambah lampu putih
@@ -248,11 +441,13 @@ static void sirenSet(bool on, bool ours) {
         return;
     }
     if (on) {
+        noiseCancel(VOLUME_SIREN);
         dfplayer.volume(VOLUME_SIREN);
         dfplayer.loop(TRACK_SIREN);
         Serial.printf("[SIREN] MENYALA (%s)\n", ours ? "mandiri §2.1" : "perintah aplikasi");
     } else {
         dfplayer.stop();
+        noiseCancel(0);
         lightApply(lightTo);
         Serial.println("[SIREN] mati");
     }
@@ -301,11 +496,11 @@ static void onActuator(const char *json) {
         JsonObject w = doc["white_noise"];
         if (!dfReady) {
             status = 1;                           // §4.4: 1 gagal
-        } else if (w["on"] | false) {
-            dfplayer.volume((uint8_t)((w["volume"] | 2) * 10));   // 0-3 → 0-30
-            dfplayer.loop(TRACK_WHITE_NOISE_BASE + (uint8_t)(w["track"] | 1) - 1);
         } else {
-            dfplayer.stop();
+            noiseSet(w["on"] | false,
+                     (uint8_t)(w["volume"] | 2),
+                     (uint8_t)(w["track"] | 1),
+                     (uint16_t)(w["fade_s"] | 0));
         }
     }
 
@@ -406,17 +601,57 @@ static void micLoop() {
     static uint8_t windowPeakDb = 0;
 
     if (i2s.readBytes((char *)block, sizeof(block)) == sizeof(block)) {
+        micBlocks++;
         // INMP441 mengirim 24 bit yang rata kiri di dalam slot 32 bit.
-        double sum_sq = 0;
-        for (size_t i = 0; i < MIC_BLOCK_SAMPLES; i++) {
-            double s = (double)(block[i] >> 14);
-            sum_sq += s * s;
+        /* Langkah DUA, bukan satu.
+         *
+         * slot_mask minta I2S_STD_SLOT_LEFT, tapi driver tetap menyerahkan
+         * kedua slot: 1251 blok per 10 detik pada 16 kHz adalah dua kali
+         * lipat data yang seharusnya. Diukur dengan memisahkan indeks genap
+         * dan ganjil, dan ganjil keluar NOL di setiap pembacaan tanpa
+         * kecuali — mikrofon mengisi slot kiri, sisanya bantalan.
+         *
+         * Merata-ratakan bantalan itu bersama sinyal memotong RMS tepat
+         * separuh, yaitu 3,01 dB yang hilang diam-diam. Kalibrasi
+         * MIC_DB_OFFSET akan menyerapnya tanpa ada yang sadar, dan setiap
+         * ambang di snore.h ikut miring sebesar itu selamanya. */
+        /* Buang DC dulu, baru ukur.
+         *
+         * INMP441 punya offset diam yang tetap, dan RMS yang dihitung tanpa
+         * membuangnya sebagian besar mengukur offset itu — bukan suara.
+         * Gejalanya: nilai puncak yang berulang-ulang persis sama antar
+         * jendela, dan desibel yang, diadu dengan lembar data, menyiratkan
+         * kamar tidur seramai mesin pemotong rumput.
+         *
+         * Rerata per blok sudah cukup sebagai penghalang DC di sini: 128
+         * sampel pada 16 kHz adalah 8 ms, jauh lebih pendek daripada amplop
+         * dengkuran yang dicari §4.2, jadi ia membuang bias tanpa ikut
+         * memakan sinyalnya. */
+        double mean = 0;
+        for (size_t i = 0; i < MIC_BLOCK_SAMPLES; i += 2) {
+            mean += (double)(block[i] >> 14);
         }
-        double rms = sqrt(sum_sq / MIC_BLOCK_SAMPLES);
+        mean /= (MIC_BLOCK_SAMPLES / 2);
+
+        double sum_sq = 0;
+        for (size_t i = 0; i < MIC_BLOCK_SAMPLES; i += 2) {
+            double s = (double)(block[i] >> 14) - mean;
+            sum_sq += s * s;
+
+            /* Puncak, diukur SETELAH DC dibuang. "0 dB" punya beberapa sebab
+             * yang di layar terlihat sama — tidak ada blok, blok berisi nol,
+             * atau matematikanya salah — dan angka ini memisahkannya. Puncak
+             * yang masih berisi bias hanya melaporkan besar offsetnya. */
+            int32_t peak = (int32_t)(s < 0 ? -s : s);
+            if (peak > micRawPeak) micRawPeak = peak;
+        }
+        double rms = sqrt(sum_sq / (MIC_BLOCK_SAMPLES / 2));
         double db  = rms > 1.0 ? 20.0 * log10(rms) + MIC_DB_OFFSET : 0.0;
         if (db < 0)   db = 0;
         if (db > 255) db = 255;
         if ((uint8_t)db > windowPeakDb) windowPeakDb = (uint8_t)db;
+    } else {
+        micShort++;
     }
 
     if (millis() - lastSnoreFeedMs < SNORE_FEED_MS) return;
@@ -467,6 +702,11 @@ static void roomLoop() {
                    lux_x100, roomDb);
     Serial.printf("[ROOM] %.1f°C %.1f%% %.2f lux %u dB\n",
                   tempC, humidity, lux_x100 / 100.0f, roomDb);
+    Serial.printf("[MIC]  blok=%lu pendek=%lu puncak_mentah=%ld dB=%u" "\n",
+                  (unsigned long)micBlocks, (unsigned long)micShort,
+                  (long)micRawPeak, roomDb);
+    micBlocks = micShort = 0;
+    micRawPeak = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -483,6 +723,11 @@ void setup() {
     Serial.println(F("\n=== RePulse Bedside (ESP32-C3) ==="));
 
     if (PIN_AROMA >= 0) {
+        /* Urutannya penting: latch keluaran diisi dulu, baru pin dijadikan
+         * OUTPUT. Terbalik, dan ada satu denyut di mana pin menggerakkan
+         * level bawaannya — pada relay aktif-LOW itu adalah diffuser yang
+         * menyala sekejap di setiap boot. */
+        digitalWrite(PIN_AROMA, AROMA_ACTIVE_LEVEL == HIGH ? LOW : HIGH);
         pinMode(PIN_AROMA, OUTPUT);
         aromaOff();
     } else {
@@ -520,10 +765,24 @@ void setup() {
         Serial.println(F("[DFPLAYER] tidak membalas reset — coba tanpa ACK"));
         delay(200);
         dfReady = dfplayer.begin(DfSerial, /*isACK=*/false, /*doReset=*/false);
-        if (dfReady) Serial.println(F("[DFPLAYER] menjawab tanpa ACK — perintah tidak dikonfirmasi"));
+        /* JANGAN tulis "menjawab". begin() dengan isACK=false berakhir
+         * `return ... || !isACK`, jadi ia mengembalikan true tanpa bertanya
+         * apa pun ke modul — bahkan memalsukan status internal jadi "kartu
+         * online". Kalimat lamanya berbunyi seperti konfirmasi, dan sunyi
+         * total terbaca sebagai "modul sehat, pasti speakernya". */
+        if (dfReady) Serial.println(F("[DFPLAYER] DIANGGAP ada tanpa ACK — modul belum pernah menjawab sepatah pun"));
     }
-    Serial.printf("[DFPLAYER] %s\n", dfReady ? "OK" : "TIDAK DITEMUKAN");
-    if (dfReady) dfplayer.volume(20);
+    Serial.printf("[DFPLAYER] %s\n", dfReady ? "dianggap siap" : "TIDAK DITEMUKAN");
+    if (dfReady) {
+        dfplayer.volume(20);
+        /* Pertanyaan, bukan perintah. Klon yang tidak pernah membalas ACK
+         * sering tetap menjawab pertanyaan - dan jawabannya memisahkan dua
+         * kegagalan yang dari luar sama-sama sunyi: modul yang tidak membaca
+         * kartu sama sekali, dan kartu terbaca tapi treknya salah nomor. */
+        int files = dfplayer.readFileCounts();
+        if (files > 0) Serial.printf("[DFPLAYER] %d berkas terbaca di kartu" "\n", files);
+        else           Serial.println(F("[DFPLAYER] jumlah berkas tidak terjawab - kartu mungkin tidak terbaca"));
+    }
 
     i2s.setPins(PIN_MIC_BCLK, PIN_MIC_WS, -1, PIN_MIC_DIN);
     micReady = i2s.begin(I2S_MODE_STD, MIC_SAMPLE_RATE,
@@ -538,6 +797,8 @@ void setup() {
 
 void loop() {
     micLoop();
+    dfLoop();
+    noiseLoop();
     roomLoop();
     lightLoop();
     aromaLoop();
