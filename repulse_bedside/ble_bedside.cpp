@@ -65,7 +65,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
         if (g_paired_mac.isEmpty()) {
             g_paired_mac = mac;
             g_prefs.putString("band_mac", mac);
-            Serial.printf("[SCAN] Gelang dipasangkan: %s\n", mac.c_str());
+            Serial.printf("[SCAN] Gelang TERLIHAT di udara, dipasangkan: %s\n", mac.c_str());
         }
 
         if (g_cb.onBandSeen) {
@@ -109,7 +109,13 @@ void BLE_Init(const BedsideCallbacks &cb) {
     g_prefs.begin("repulse", false);
     g_paired_mac = g_prefs.getString("band_mac", "");
     if (!g_paired_mac.isEmpty()) {
-        Serial.printf("[SCAN] Gelang pasangan tersimpan: %s\n", g_paired_mac.c_str());
+        /* Dari NVS, bukan dari udara. Kalimat lamanya berbunyi seperti
+         * penemuan, dan terbaca sebagai "gelang ada" — padahal ia tetap
+         * tercetak persis sama dengan gelang tercabut. Satu kata salah di
+         * log menghabiskan waktu berjam-jam mencari masalah yang tidak
+         * ada di sana. */
+        Serial.printf("[NVS]  Pasangan diingat: %s (belum terlihat sejak boot)\n",
+                      g_paired_mac.c_str());
     }
 
     NimBLEDevice::init("RePulse Bedside");
