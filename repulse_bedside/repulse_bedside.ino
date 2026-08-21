@@ -314,6 +314,52 @@ static bool     noiseStopAtEnd = false;
  *
  * Dikuras tiap putaran loop dan dicetak apa adanya. Satu baris di serial
  * lebih murah daripada satu jam membongkar kabel yang sudah benar. */
+/* Modul ini tidak menghormati perintah loop.
+ *
+ * `loop(n)` adalah 0x08, "putar berulang", dan sebagian klon memperlakukannya
+ * sebagai putar sekali. Gejalanya menipu: white noise berdurasi 15 menit
+ * terlihat seperti berhasil berulang, sementara sirene 8 detik berhenti
+ * sendiri di tengah keadaan darurat — kegagalan yang cuma kelihatan pada
+ * berkas pendek, yaitu justru berkas yang paling penting.
+ *
+ * Jadi pengulangannya dipegang firmware, bukan modul, lewat dua jalur:
+ *
+ *   Pesan trek-selesai. Bersih dan tepat waktu, tapi hanya ada kalau kaki TX
+ *   modul benar-benar sampai ke GPIO2 — dan sepanjang satu malam ternyata
+ *   tidak, karena GND-nya tidak pernah mencapai papan.
+ *
+ *   Pengawas waktu. Kasar, tapi tetap bekerja pada modul yang sama sekali
+ *   bisu. Ia yang menjaga janji §6.3 kalau jalur balik itu putus lagi. */
+
+#define SIREN_TRACK_MS      8000   // panjang berkas sirene; sesuaikan bila diganti
+#define REPLAY_GUARD_MS      400   // jangan memicu ulang dua kali untuk satu akhir
+
+static uint8_t  dfTrack     = 0;   // 0 = tidak ada yang harus terus berbunyi
+static uint32_t dfStartedMs = 0;
+
+static void dfPlayLooping(uint8_t track) {
+    dfTrack     = track;
+    dfStartedMs = millis();
+    dfplayer.loop(track);
+}
+
+static void dfStopLooping() {
+    dfTrack = 0;
+    dfplayer.stop();
+}
+
+/* Hanya sirene yang diawasi jam. White noise berdurasi menit dan tidak punya
+ * panjang yang kita ketahui, jadi memicunya ulang berdasarkan tebakan waktu
+ * justru memotongnya di tengah — untuk itu pesan trek-selesai sudah cukup,
+ * dan jeda seperseratus detik tiap seperempat jam tidak membangunkan siapa
+ * pun. Sirene yang diam empat detik membangunkan siapa pun juga tidak. */
+static void dfReplayLoop() {
+    if (dfTrack != TRACK_SIREN) return;
+    if (millis() - dfStartedMs < SIREN_TRACK_MS) return;
+    dfStartedMs = millis();
+    dfplayer.loop(dfTrack);
+}
+
 static void dfLoop() {
     if (!dfplayer.available()) return;
 
@@ -324,7 +370,16 @@ static void dfLoop() {
         case DFPlayerCardOnline:   Serial.println(F("[DF] kartu SD terbaca")); break;
         case DFPlayerCardInserted: Serial.println(F("[DF] kartu dimasukkan")); break;
         case DFPlayerCardRemoved:  Serial.println(F("[DF] kartu DICABUT")); break;
-        case DFPlayerPlayFinished: Serial.printf("[DF] trek %d selesai" "\n", val); break;
+        case DFPlayerPlayFinished:
+            Serial.printf("[DF] trek %d selesai" "\n", val);
+            /* Guard: sebagian modul mengirim pesan ini dua kali untuk satu
+             * akhir, dan memutar ulang dua kali menghasilkan trek yang
+             * terpotong seketika. */
+            if (dfTrack != 0 && millis() - dfStartedMs > REPLAY_GUARD_MS) {
+                dfStartedMs = millis();
+                dfplayer.loop(dfTrack);
+            }
+            break;
         case DFPlayerFeedBack:     Serial.printf("[DF] balasan %d" "\n", val); break;
         case WrongStack:           Serial.println(F("[DF] paket rusak - periksa kabel TX/RX")); break;
         case TimeOut:              Serial.println(F("[DF] tidak menjawab dalam waktunya")); break;
@@ -370,7 +425,7 @@ static void noiseSet(bool on, uint8_t level0_3, uint8_t track, uint16_t fade_s) 
         /* Mulai dari senyap, lalu naik. Menyalakan trek dulu pada volume
          * lama berarti satu ketukan keras sebelum fade sempat mulai. */
         noiseApply(0);
-        dfplayer.loop(TRACK_WHITE_NOISE_BASE + (track > 0 ? track : 1) - 1);
+        dfPlayLooping(TRACK_WHITE_NOISE_BASE + (track > 0 ? track : 1) - 1);
     }
 
     noiseOn        = on;
@@ -384,7 +439,7 @@ static void noiseSet(bool on, uint8_t level0_3, uint8_t track, uint16_t fade_s) 
      * mendengar tiap langkah volume tanpa menunggu setengah menit. */
     if (noiseFadeMs == 0) {
         noiseApply(target);
-        if (noiseStopAtEnd) dfplayer.stop();
+        if (noiseStopAtEnd) dfStopLooping();
     }
 
     Serial.printf("[NOISE] %s vol %u→%u fade %us\n",
@@ -414,7 +469,7 @@ static void noiseLoop() {
         /* Baru berhenti setelah senyap. Memanggil stop() saat perintah
          * datang akan memotong fade turun sebelum bunyi pertama meredup. */
         if (noiseStopAtEnd) {
-            dfplayer.stop();
+            dfStopLooping();
             noiseStopAtEnd = false;
             Serial.println("[NOISE] senyap, trek berhenti");
         }
@@ -443,10 +498,10 @@ static void sirenSet(bool on, bool ours) {
     if (on) {
         noiseCancel(VOLUME_SIREN);
         dfplayer.volume(VOLUME_SIREN);
-        dfplayer.loop(TRACK_SIREN);
+        dfPlayLooping(TRACK_SIREN);
         Serial.printf("[SIREN] MENYALA (%s)\n", ours ? "mandiri §2.1" : "perintah aplikasi");
     } else {
-        dfplayer.stop();
+        dfStopLooping();
         noiseCancel(0);
         lightApply(lightTo);
         Serial.println("[SIREN] mati");
@@ -798,6 +853,7 @@ void setup() {
 void loop() {
     micLoop();
     dfLoop();
+    dfReplayLoop();
     noiseLoop();
     roomLoop();
     lightLoop();
