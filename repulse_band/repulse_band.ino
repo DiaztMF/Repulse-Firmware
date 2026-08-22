@@ -138,6 +138,23 @@
 #define MOTOR_GATE_MS               200
 #define MOTOR_SOFT_DUTY             110
 #define MOTOR_HARD_DUTY             255
+
+/* Sentakan awal, dan berapa lama ia bertahan.
+ *
+ * Getaran halus tidak pernah terasa sementara yang keras selalu terasa,
+ * dan alasannya bukan di logika: 110 dari 255 pada 8 bit adalah 43%,
+ * yang di rel 3,3 V rata-ratanya sekitar 1,4 V. Motor ERM koin butuh
+ * kira-kira 2,3 V untuk MULAI berputar dari diam. Jadi perintahnya
+ * terkirim, PWM-nya benar, dan porosnya tidak pernah lepas dari gesekan
+ * statis. Yang keras jalan hanya karena 255 berarti tegangan penuh.
+ *
+ * Sekali berputar, motor bertahan di duty yang jauh lebih rendah daripada
+ * yang dibutuhkannya untuk mulai. Jadi setiap getaran kini dimulai dengan
+ * sentakan penuh, lalu turun ke dutynya yang sebenarnya.
+ *
+ * ponytail: 60 ms cukup untuk motor koin yang biasa; kalau motormu lebih
+ * berat dan masih diam, naikkan ini dulu sebelum menyentuh SOFT_DUTY. */
+#define MOTOR_KICK_MS                60
 #define MOTOR_PWM_FREQ             5000
 #define MOTOR_PWM_BITS                8
 
@@ -390,26 +407,47 @@ static uint32_t nowEpoch() {
 // MOTOR GETAR
 // =============================================================
 
+static uint8_t  motorHoldDuty   = 0;
+static uint32_t motorKickAtMs   = 0;
+
 static void vibrate(
     bool hard,
     uint32_t duration_ms
 ) {
-    uint8_t duty = hard
+    motorHoldDuty = hard
         ? MOTOR_HARD_DUTY
         : MOTOR_SOFT_DUTY;
 
+    // Selalu berangkat dari tegangan penuh, apa pun duty tujuannya.
     ledcWrite(
         PIN_MOTOR,
-        duty
+        MOTOR_HARD_DUTY
     );
 
     motorOn = true;
+    motorKickAtMs = millis() + MOTOR_KICK_MS;
     motorOffAtMs = millis() + duration_ms;
 }
 
 static void motorLoop() {
     if (!motorOn) {
         return;
+    }
+
+    /* Turun dari sentakan ke duty sebenarnya. Nol berarti sudah turun,
+     * jadi getaran keras melewati langkah ini tanpa menulis apa pun. */
+    if (
+        motorKickAtMs != 0 &&
+        (int32_t)(millis() - motorKickAtMs) >= 0
+    ) {
+        motorKickAtMs = 0;
+
+        if (motorHoldDuty != MOTOR_HARD_DUTY) {
+            ledcWrite(
+                PIN_MOTOR,
+                motorHoldDuty
+            );
+        }
     }
 
     if ((int32_t)(millis() - motorOffAtMs) < 0) {
@@ -422,6 +460,7 @@ static void motorLoop() {
     );
 
     motorOn = false;
+    motorKickAtMs = 0;
 }
 
 static bool motionTrusted() {
