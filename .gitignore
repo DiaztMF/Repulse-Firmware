@@ -4,3 +4,6 @@ build/
 *.elf
 *.bin
 *.map
+
+# Ekspor sketsa untuk dibagikan. Hasil, bukan sumber.
+*.zip

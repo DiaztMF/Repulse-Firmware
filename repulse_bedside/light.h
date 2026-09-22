@@ -73,8 +73,14 @@ inline Rgb suppress_blue(Rgb c, uint8_t percent_kept) {
     return c;
 }
 
-/* Warna akhir untuk satu mode, sudah dikalikan kecerahan. */
-inline Rgb light_color(const char *mode, uint16_t kelvin, uint8_t brightness) {
+/* Warna akhir untuk satu mode, sudah dikalikan kecerahan.
+ *
+ * `custom` adalah warna pilihan pengguna (§4.3 `light.rgb`). Dipakai apa
+ * adanya, tanpa penekanan biru: pengguna yang memilihnya, dan aplikasi yang
+ * memperingatkan soal cahaya biru. `alert` dan `off` tidak pernah
+ * mengikutinya — lampu darurat harus tetap putih penuh. */
+inline Rgb light_color(const char *mode, uint16_t kelvin, uint8_t brightness,
+                       const Rgb *custom = nullptr) {
     Rgb c;
     if (!mode) mode = "off";
 
@@ -82,6 +88,8 @@ inline Rgb light_color(const char *mode, uint16_t kelvin, uint8_t brightness) {
         c = { 255, 255, 255 };            // §PRD 6.3: lampu putih 100%
     } else if (!strcmp(mode, "off")) {
         return { 0, 0, 0 };
+    } else if (custom) {
+        c = *custom;
     } else {
         c = kelvin_to_rgb(kelvin);
         // sunset dan amber menuju tidur; sunrise membangunkan, biarkan biru.
@@ -94,4 +102,20 @@ inline Rgb light_color(const char *mode, uint16_t kelvin, uint8_t brightness) {
     c.g = (uint8_t)((uint16_t)c.g * brightness / 255);
     c.b = (uint8_t)((uint16_t)c.b * brightness / 255);
     return c;
+}
+
+struct LightRamp { uint8_t from, to; };
+
+/* Dari mana ke mana sebuah perintah bergerak.
+ *
+ * Sunset membawa kecerahan AWAL dan selalu berakhir gelap (PRD: "Akhir: mati
+ * total"). Versi sebelumnya memperlakukannya seperti mode lain — berangkat
+ * dari kecerahan sekarang, yang malam hari adalah 0, menuju 40 — sehingga
+ * kamar makin terang selama 25 menit menjelang tidur, lalu padam mendadak
+ * saat monitoring dimulai. Mode lain memang bergerak dari keadaan sekarang
+ * menuju target. */
+inline LightRamp light_endpoints(const char *mode, uint8_t now, uint8_t target,
+                                 uint32_t ramp_s) {
+    if (mode && !strcmp(mode, "sunset") && ramp_s > 0) return { target, 0 };
+    return { now, target };
 }

@@ -7,7 +7,6 @@
  *
  * Output:
  * - Motor getar pada GPIO1
- * - UART menuju ESP32-C6 display
  *
  * Input:
  * - Tombol SOS pada GPIO3
@@ -22,8 +21,6 @@
 #include <ArduinoJson.h>
 
 #include <MAX30105.h>
-#include <heartRate.h>
-#include <spo2_algorithm.h>
 
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -31,6 +28,7 @@
 #include "ble_band.h"
 #include "ladder.h"
 #include "evtbuf.h"
+#include "ppg.h"
 
 // =============================================================
 // PIN ESP32-C3
@@ -42,8 +40,11 @@
 #define PIN_BUTTON          3
 #define PIN_MOTOR           1
 
-#define PIN_UART_OUT        7
-#define PIN_UART_IN         6
+/* GPIO6 dan GPIO7 dulu UART ke layar ESP32-C6. Rangkaian final tidak punya
+ * layar — gelang melaporkan lewat BLE saja — jadi keduanya bebas. Kalau
+ * nanti dipakai, JANGAN pindah ke GPIO2, GPIO8, atau GPIO9: tiga itu
+ * strapping pin, dan GPIO9 rendah saat reset melempar chip ke download mode
+ * (tidak ada firmware jalan, serial kosong, LED biru mati). */
 
 #define PIN_ECG_OUT        -1
 #define PIN_ECG_LO_P       -1
@@ -56,7 +57,14 @@
 // =============================================================
 
 #define SERIAL_BAUD             115200
-#define C6_BAUD                 57600
+
+/* Laju cuplik yang BENAR-BENAR keluar dari FIFO: SAMPLE_RATE / SAMPLE_AVERAGE.
+ * ppg.h menurunkan seluruh tetapan waktunya dari angka ini, jadi mengubah
+ * rata-rata perangkat keras di initMAX30102() tidak diam-diam menggeser
+ * filter mana pun — asalkan angka ini ikut diubah. */
+#define PPG_SAMPLE_RATE         100
+#define PPG_SAMPLE_AVERAGE        4
+#define PPG_SPS                 ((float)PPG_SAMPLE_RATE / PPG_SAMPLE_AVERAGE)
 
 #define SERIAL_HEARTBEAT             1
 
@@ -64,7 +72,7 @@
 #define MOTION_INTERVAL_MS        1000
 #define STATUS_INTERVAL_MS      300000
 #define OFFLINE_SUMMARY_MS       60000
-#define C6_INTERVAL_MS            1000
+#define LOG_INTERVAL_MS           1000
 
 #define SOS_HOLD_MS               2000
 #define DISCONNECT_GRACE_MS      30000
@@ -73,55 +81,49 @@
 // MAX30102
 // =============================================================
 
-/* Ambang "dipakai", dan IR yang dianggap kualitas penuh.
+/* Deteksi kontak, denyut, dan SpO2 sekarang ada di ppg.h, diadaptasi dari
+ * AsaWatch. Ambang IR dan seluruh tetapan waktu ikut pindah ke sana supaya
+ * satu tempat saja yang memilikinya — dulu ambangnya di sini sementara
+ * filter yang memakainya di bawah, dan keduanya bergeser sendiri-sendiri.
  *
- * Angka 100000/220000 yang semula ada di sini adalah angka UJUNG JARI. Di
- * ujung jari IR memang menembus seratus ribu; di pergelangan tangan cahaya
- * menembus kulit yang lebih tebal, lewat tendon dan tulang, dan DC-nya turun
- * satu orde. Sekali kuturunkan jadi setengahnya, dan worn tetap nol terus —
- * yang berarti IR di pergelangan bahkan tidak sampai 50000.
+ * Yang hilang dari sini beserta alasannya:
+ *   BEAT_CENTRE / BEAT_BASELINE_SHIFT  tambalan untuk batas 16 bit di dalam
+ *                                      checkForBeat. Detektor baru bekerja
+ *                                      di titik mengambang, jadi tidak ada
+ *                                      batas untuk diakali.
+ *   IR_WORN_THRESHOLD 5000             tebakan, dan diambil saat arus LED
+ *                                      masih 0x7F. Sekarang PPG_IR_PRESENT
+ *                                      di ppg.h, pada arus penuh.
+ *   SPO2_BUFFER_LEN 100                penyangga untuk algoritma Maxim, yang
+ *                                      menaikkan spo2Valid pada derau. Diganti
+ *                                      jendela AC-RMS satu detik dengan
+ *                                      gerbang kewajaran R dan PI.
  *
- * Tanpa kulit di depannya, dengan LED menyala, MAX30102 membaca ratusan
- * sampai seribuan. Jadi 5000 masih jauh di atas lantai "tidak dipakai" dan
- * jauh di bawah tebakan mana pun untuk kulit pergelangan.
- *
- * ponytail: 5000/25000 adalah nilai sementara, bukan hasil ukur. [CAL]
- * mencetak IR= dua kali sedetik — baca angkanya di pergelangan DAN di atas
- * meja, lalu taruh ambangnya di tengah kedua angka itu. */
-#define IR_WORN_THRESHOLD         5000
-#define IR_QUALITY_FULL          25000
+ * Untuk mengubah ambang kontak tanpa menyunting ppg.h:
+ *   #define PPG_IR_PRESENT 45000.0f   sebelum #include "ppg.h" */
 #define IR_CALIBRATION               1
 
-/* Titik tengah yang disuapkan ke detektor, dan seberapa lambat garis dasar
- * DC-nya bergerak.
- *
- * checkForBeat menguji amplitudo AC terhadap jendela tetap dalam satuan yang
- * kita suapkan sendiri:
- *
- *     if ((IR_AC_Max - IR_AC_Min) > 20 && (IR_AC_Max - IR_AC_Min) < 1000)
- *
- * Di ujung jari AC sekitar 1-5% dari DC dan jendela itu pas. Di pergelangan
- * AC hanya 0,1-0,5%, dan kode ini dulu menyuapkan `ir >> 3` — membagi AC
- * yang sudah lemah itu delapan kali lagi, jauh di bawah ambang 20. Pembagian
- * itu ada semata untuk menahan DC di bawah batas 16 bit averageDCEstimator,
- * tapi ia menyelesaikan masalah DC dengan menghancurkan sinyal yang dicari.
- *
- * Sekarang DC dibuang dengan PENGURANGAN. Garis dasarnya bergerak lambat
- * (>>8 pada 100 sampel/detik ≈ 2,5 detik, jauh lebih lambat daripada satu
- * denyut, jadi ia tidak ikut memakan pulsanya), dan yang disuapkan adalah
- * titik tengah ditambah simpangannya. DC tetap aman, AC utuh — delapan kali
- * lebih besar daripada sebelumnya di pergelangan yang sama. */
-#define BEAT_CENTRE              20000
-#define BEAT_BASELINE_SHIFT          8
+/* Berapa lama BPM dan RR terakhir masih dianggap mewakili sekarang. Milik
+ * .ino, bukan ppg.h: yang di sana menjepit kualitas, yang ini memutuskan
+ * apakah §3.1 boleh mengirim angkanya sama sekali. */
 #define BEAT_STALE_MS             4000
 
-#define SPO2_PLAUSIBLE_MIN          70
-#define SPO2_BUFFER_LEN            100
-
-// Sensor menghasilkan 100 sampel/detik.
-// Setiap empat sampel dirata-ratakan agar algoritma Maxim
-// menerima sekitar 25 sampel/detik.
-#define SPO2_AVERAGE_SAMPLES          4
+/* Denyut terakhir yang terukur ditahan SELAMA GELANG TERPASANG, dan hilang
+ * saat dilepas. Tidak ada batas waktu.
+ *
+ * Batas tiga puluh detik dulu ada di sini dan sudah dihapus atas permintaan
+ * yang jelas: selama gelang di pergelangan, layar harus punya angka. Yang
+ * dikorbankan nyata dan perlu ditulis - kalau optiknya berhenti membaca
+ * sementara gelangnya tetap terpasang, layar menunjukkan angka lama tanpa
+ * mengatakan berapa lama, dan tidak ada apa pun di layar yang membedakan
+ * denyut semenit lalu dari denyut sejam lalu.
+ *
+ * Yang membuatnya masih layak dikerjakan: tidak ada satu pun keputusan yang
+ * memakainya. Paket §3.1 menandainya dengan bit 6, jadi aplikasi tahu; skor
+ * malam dan denyut istirahat menolak sampel tahanan seluruhnya; dan tangga
+ * eskalasi di dalam gelang memakai bpmIsValid() yang tetap ketat dan tidak
+ * pernah melihat nilai tahanan sama sekali. Angka ini hanya untuk dilihat
+ * manusia, tidak untuk dipercaya mesin. */
 
 // =============================================================
 // VALIDASI RR
@@ -188,6 +190,37 @@ struct BandConfig {
     uint16_t rr_min_ms = 300;
     uint16_t rr_max_ms = 2000;
 
+    /* Berapa lama keadaan di luar ambang harus BERTAHAN sebelum tangga
+     * dinaikkan.
+     *
+     * Sebelumnya nol: satu sampel di atas ambang langsung memulai tahap 1.
+     * Di pergelangan yang ikatannya belum kencang, avgBPM bergoyang
+     * beberapa denyut setiap beberapa detik, jadi satu lonjakan sesaat
+     * cukup untuk membangunkan seluruh sistem. Alarm klinis mana pun
+     * menuntut keadaannya bertahan dulu, justru karena sensor selalu lebih
+     * berisik daripada tubuh yang diukurnya. */
+    uint16_t anomaly_hold_s = 12;
+
+    /* Kualitas sinyal minimum sebelum angka denyut boleh dipakai untuk
+     * MEMUTUSKAN. Lebih ketat daripada rr_min_quality, yang hanya menjaga
+     * satu interval RR: keputusan ini membangunkan orang.
+     *
+     * Kenapa 5 dan bukan angka lain: quality() menahan nilainya di 4 kalau
+     * tidak ada denyut dalam 4 detik terakhir. Jadi 5 adalah angka
+     * TERKECIL yang tidak bisa dipalsukan oleh cahaya terang tanpa denyut
+     * di dalamnya — ia otomatis berarti "ada denyut baru DAN perfusinya
+     * cukup". Menaikkannya lebih tinggi menuntut IR yang di pergelangan
+     * belum tentu tercapai, dan gelang yang diam sepanjang malam adalah
+     * kegagalan yang jauh lebih berbahaya daripada alarm palsu. Bisa
+     * disetel dari aplikasi kalau kamar dan kulitnya bicara lain. */
+    uint8_t anomaly_min_quality = 5;
+
+    /* 0 = deteksi anomali dimatikan sementara. Tombol SOS dan seluruh
+     * perekaman malam tetap jalan; yang berhenti hanya tangga yang naik
+     * sendiri. Ada untuk demo dan untuk pemasangan ulang sensor, dan
+     * aplikasi menampilkan peringatan selama ini menyala. */
+    uint8_t anomaly_enabled = 1;
+
     // Syarat kualitas pembacaan RR.
     uint8_t rr_min_quality = 3;
     uint16_t rr_motion_limit_mg = 200;
@@ -204,16 +237,14 @@ static BandConfig cfg;
 // OBJEK HARDWARE
 // =============================================================
 
-extern int16_t IR_AC_Max;
-extern int16_t IR_AC_Min;
-
 static MAX30105 maxSensor;
+
+/* Seluruh DSP optik. Murni dan teruji di komputer — test/ppg_test.cpp. */
+static Ppg ppg(PPG_SPS);
 static Adafruit_MPU6050 mpu6050;
 
 static Ladder ladder;
 static EventBuffer offline;
-
-static HardwareSerial C6(1);
 
 // =============================================================
 // STATUS HARDWARE
@@ -245,6 +276,21 @@ static uint32_t previousPeakMs = 0;
 static uint32_t lastBeatMs = 0;
 
 static float avgBPM = 0.0f;
+
+/* Denyut terakhir yang benar-benar lolos seluruh rantai pemeriksaan, dan
+ * kapan ia lolos. Hanya untuk ditampilkan.
+ *
+ * `heldAtMs` tidak lagi dipakai sebagai kedaluwarsa - lihat catatan di
+ * bagian atas. Disimpan karena log kalibrasi memakainya untuk menjawab
+ * "sudah berapa lama angka ini tidak berubah", yang tepat pertanyaan yang
+ * tidak bisa dijawab dari layar. */
+static uint8_t heldBPM = 0;
+static uint32_t heldAtMs = 0;
+
+/* Satu paket punya satu byte status, jadi bendera held berlaku untuk
+ * seluruh paket. Ini menandai bahwa ada sampel di dalamnya yang denyutnya
+ * diingat, bukan diukur. */
+static bool heldInBatch = false;
 static uint8_t bpmBeatCount = 0;
 
 static uint16_t lastRRms = 0;
@@ -264,17 +310,13 @@ static uint8_t vitalsCount = 0;
 // =============================================================
 
 /* Garis dasar DC lambat untuk detektor denyut. 0 = belum ada sampel. */
-static int32_t  irBaseline = 0;
 
-static uint32_t irBuf[SPO2_BUFFER_LEN];
-static uint32_t redBuf[SPO2_BUFFER_LEN];
+/* Kapan jendela SpO2 terakhir lahir. Jarak kirim 20 detik lebih panjang
+ * daripada umur satu jendela, jadi tanpa ini angka lama bisa terkirim
+ * sebagai angka sekarang. */
+static uint32_t lastSpo2WindowMs = 0;
+#define SPO2_FRESH_MS 5000
 
-static uint16_t spo2Filled = 0;
-static bool spo2Collecting = false;
-
-static uint32_t spo2IrSum = 0;
-static uint32_t spo2RedSum = 0;
-static uint8_t spo2AverageCount = 0;
 
 static uint8_t spo2Value = 0;
 static bool spo2ValueValid = false;
@@ -307,10 +349,13 @@ static bool motorOn = false;
 // TOMBOL SOS
 // =============================================================
 
-static volatile uint32_t buttonDownMs = 0;
-static volatile bool buttonHeld = false;
-
-static bool sosLatched = false;
+/* Tidak lagi volatile: tidak ada interrupt yang menyentuhnya. Lihat
+ * buttonLoop() untuk alasannya. */
+static bool     buttonRaw    = false;   // bacaan pin apa adanya
+static uint32_t buttonEdgeMs = 0;       // kapan bacaan mentah terakhir berubah
+static bool     buttonHeld   = false;   // keadaan yang sudah tenang
+static uint32_t buttonDownMs = 0;       // kapan tekanan yang tenang dimulai
+static bool     sosLatched   = false;
 
 // =============================================================
 // ECG
@@ -335,7 +380,7 @@ static uint32_t lastVitalsMs = 0;
 static uint32_t lastMotionMs = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastSummaryMs = 0;
-static uint32_t lastC6Ms = 0;
+static uint32_t lastLogMs = 0;
 static uint32_t lastSpo2Ms = 0;
 
 static uint32_t disconnectedSinceMs = 0;
@@ -388,6 +433,45 @@ static void resetVitalData() {
     rrIdx = 0;
 
     vitalsCount = 0;
+
+    /* Kontak hilang berarti tidak ada lagi yang layak ditahan. Menahan
+     * denyut seseorang setelah gelangnya dilepas adalah angka yang bukan
+     * milik siapa pun. */
+    heldBPM = 0;
+    heldAtMs = 0;
+    heldInBatch = false;
+}
+
+/**
+ * Irama hilang, denyutnya tidak.
+ *
+ * Satu jarak yang terlalu renggang dulu memanggil resetVitalData() dan
+ * membuang SEMUANYA: rata-rata, hitungan denyut, seluruh riwayat RR. Lalu
+ * bpmIsValid() menuntut tiga denyut baru sebelum mau menjawab lagi.
+ *
+ * Di pergelangan, denyut yang terlewat itu peristiwa rutin - satu puncak
+ * tertelan gerakan dan jaraknya langsung jadi dua kali lipat. Jadi satu
+ * kedipan optik membuang pengetahuan satu menit, tiga denyut kemudian ia
+ * pulih, lalu terlewat lagi. Itulah diam yang datang dan pergi, dan itu
+ * bukan sensornya - itu baris ini.
+ *
+ * Yang benar-benar tidak lagi dipercaya setelah jeda panjang adalah
+ * IRAMANYA: median RR dan riwayatnya tidak lagi menggambarkan apa pun.
+ * Rata-rata denyutnya masih menggambarkan orang yang sama.
+ */
+static void resyncRhythm() {
+    lastRRms = 0;
+    lastValidRRAtMs = 0;
+    rrValid = false;
+
+    memset(
+        rrHistory,
+        0,
+        sizeof(rrHistory)
+    );
+
+    rrCount = 0;
+    rrIdx = 0;
 }
 
 // =============================================================
@@ -477,26 +561,74 @@ static bool motionTrusted() {
 // TOMBOL SOS
 // =============================================================
 
-static void IRAM_ATTR buttonISR() {
-    if (digitalRead(PIN_BUTTON) == LOW) {
-        buttonDownMs = millis();
-        buttonHeld = true;
-    } else {
-        buttonHeld = false;
-    }
-}
+/* Dulu ini interrupt, dan itulah sebabnya tombolnya kadang "ditekan tapi
+ * tidak terjadi apa-apa".
+ *
+ * ISR-nya memanggil digitalRead() saat ISR BERJALAN, bukan membaca tepi yang
+ * memicunya. Sakelar mekanis memantul 1-20 ms, jadi interrupt bisa terpicu
+ * oleh tepi turun lalu membaca pin yang sudah memantul kembali ke HIGH:
+ * buttonHeld tertulis false padahal jari masih menekan. Tidak ada tepi lain
+ * yang akan datang untuk membetulkannya - tombol itu mati sampai dilepas
+ * dan ditekan ulang, dan orang yang menekannya tidak punya cara tahu.
+ *
+ * Polling tidak bisa desinkron dengan pin, karena ia MEMBACA pin. loop()
+ * berputar jauh lebih cepat dari 25 ms, dan sekarang tidak ada lagi
+ * volatile, IRAM_ATTR, atau millis() di dalam interrupt. */
+#define BUTTON_DEBOUNCE_MS 25
 
 static void buttonLoop() {
-    if (!buttonHeld) {
-        sosLatched = false;
+    const uint32_t now = millis();
+
+    const bool raw =
+        digitalRead(PIN_BUTTON) == LOW;
+
+    if (raw != buttonRaw) {
+        buttonRaw = raw;
+        buttonEdgeMs = now;
+    }
+
+    // Masih memantul; bacaannya belum layak dipercaya.
+    const bool settled =
+        (now - buttonEdgeMs) >= BUTTON_DEBOUNCE_MS;
+
+    if (settled && raw != buttonHeld) {
+        buttonHeld = raw;
+
+        if (buttonHeld) {
+            buttonDownMs = now;
+
+            /* Satu ketukan pendek supaya jari tahu tekanannya terbaca dan
+             * layak ditahan. Tanpa ini, dua detik pertama tidak bisa
+             * dibedakan dari tombol rusak - dan orang melepasnya di detik
+             * pertama, persis seperti yang terjadi. */
+            vibrate(
+                false,
+                80
+            );
+
+            /* Dicetak di sini, bukan hanya saat SOS berangkat: kalau
+             * baris ini tidak pernah muncul, masalahnya kabel atau pin,
+             * bukan lama tahan. */
+            Serial.println(
+                "[SOS] Tombol ditekan, tahan 2 detik"
+            );
+        } else {
+            if (!sosLatched) {
+                Serial.printf(
+                    "[SOS] Dilepas setelah %lu ms, belum cukup\n",
+                    (unsigned long)(now - buttonDownMs)
+                );
+            }
+
+            sosLatched = false;
+        }
+    }
+
+    if (!buttonHeld || sosLatched) {
         return;
     }
 
-    if (sosLatched) {
-        return;
-    }
-
-    if (millis() - buttonDownMs < SOS_HOLD_MS) {
+    if (now - buttonDownMs < SOS_HOLD_MS) {
         return;
     }
 
@@ -543,128 +675,115 @@ static void initMAX30102() {
         return;
     }
 
-    /* Nilai-nilai ini TERBUKTI di pergelangan: dengan setelan inilah `worn`
-     * pernah bernilai 1 dan kualitas mencapai 4.
+    /* Setelan AsaWatch, yang diuji di pergelangan pada belasan subjek.
      *
-     * Sempat kunaikkan arus LED ke 0xFF, kuperkecil rentang ADC ke 4096 nA,
-     * dan kupindah laju cuplik ke 400 dengan rata-rata perangkat keras 4 —
-     * empat perubahan sekaligus, dan sesudahnya worn serta kualitas jatuh ke
-     * nol terus. Empat perubahan sekaligus berarti tidak ada yang tahu mana
-     * yang bersalah, jadi semuanya dikembalikan.
+     * Catatan lama di sini memperingatkan bahwa menaikkan arus LED ke 0xFF
+     * pernah membuat `worn` jatuh ke nol — dan peringatan itu benar, tetapi
+     * bukan karena arusnya. Empat hal diubah sekaligus waktu itu, dan salah
+     * satunya memperkecil rentang ADC ke 4096 nA: pada arus penuh itu justru
+     * menjenuhkan ADC, jadi sinyalnya terpotong rata dan tidak ada AC yang
+     * tersisa untuk dideteksi. Di sini rentangnya 16384 nA — headroom
+     * terbesar — justru KARENA arusnya penuh.
      *
-     * Kalau sensitivitas optik perlu dinaikkan lagi: ubah SATU angka, uji di
-     * pergelangan, baru yang berikutnya. */
+     * Arus penuh memang yang dibutuhkan pergelangan: cahaya menembus kulit
+     * lebih tebal, lewat tendon dan tulang, dan DC-nya turun satu orde
+     * dibanding ujung jari. Ambang kontak di ppg.h (30000) mengandaikan
+     * arus ini; keduanya harus berubah bersama. */
     maxSensor.setup(
-        0x7F,   // LED brightness
-        1,      // tanpa hardware average: 100 sampel/detik
-        2,      // RED + IR
-        100,    // sample rate
-        411,    // pulse width
-        16384   // ADC range
+        0xFF,                 // arus penuh — sinyal pergelangan lemah
+        PPG_SAMPLE_AVERAGE,   // rata-rata perangkat keras
+        2,                    // RED + IR
+        PPG_SAMPLE_RATE,
+        411,                  // lebar pulsa -> ADC 18 bit
+        16384                 // rentang ADC: headroom terbesar
     );
 
-    maxSensor.setPulseAmplitudeRed(
-        0x7F
-    );
+    maxSensor.setPulseAmplitudeRed(0xFF);
+    maxSensor.setPulseAmplitudeIR(0xFF);
 
-    maxSensor.setPulseAmplitudeIR(
-        0x7F
-    );
+    ppg.configure(PPG_SPS);
 
     max30102Ready = true;
 
-    Serial.println(
-        F(" OK")
+    Serial.printf(
+        " OK (%d sampel/detik, ambang kontak %.0f, koreksi SpO2 %+.1f%s)\n",
+        (int)PPG_SPS,
+        (double)ppg.threshold(),
+        (double)ppg.wristOffset(),
+        ppg.wristOffset() == 0.0f ? " = MODE JARI" : " = pergelangan"
     );
 }
+
 
 // =============================================================
 // WORN DAN SIGNAL QUALITY
 // =============================================================
 
-static void updateWornAndQuality(
-    uint32_t ir
-) {
-    if (worn) {
-        worn =
-            ir >
-            (IR_WORN_THRESHOLD * 4UL) / 5UL;
-    } else {
-        worn =
-            ir >
-            IR_WORN_THRESHOLD;
-    }
+static void applyPpg(const PpgOut &o) {
+    worn = o.worn;
 
-    if (!worn) {
-        opticalQuality = 0;
-        signalQuality = 0;
+    /* Satu angka, dua pemakai. §3.1 mengirim signalQuality; gerbang RR di
+     * bawah memakai opticalQuality. Dulu keduanya dihitung terpisah di sini
+     * dari ambang yang sama, jadi keduanya selalu sama saja — sekarang
+     * keduanya memang satu. */
+    opticalQuality = o.quality;
+    signalQuality = o.quality;
 
+    if (o.worn_changed && !o.worn) {
         resetVitalData();
-
         spo2Value = 0;
         spo2ValueValid = false;
-
-        if (spo2Collecting) {
-            spo2Collecting = false;
-            spo2Filled = 0;
-
-            spo2IrSum = 0;
-            spo2RedSum = 0;
-            spo2AverageCount = 0;
-
-            lastSpo2Ms = millis();
-        }
-    } else {
-        uint32_t span =
-            IR_QUALITY_FULL -
-            IR_WORN_THRESHOLD;
-
-        uint32_t above =
-            ir -
-            IR_WORN_THRESHOLD;
-
-        opticalQuality =
-            above >= span
-            ? 15
-            : (uint8_t)(
-                (above * 15UL) / span
-            );
-
-        signalQuality =
-            opticalQuality;
-
-        bool stale =
-            lastBeatMs == 0 ||
-            millis() - lastBeatMs >
-                BEAT_STALE_MS;
-
-        if (
-            stale &&
-            signalQuality > 4
-        ) {
-            signalQuality = 4;
-        }
     }
 
 #if IR_CALIBRATION
-    static uint32_t lastPrintMs = 0;
+    /* Satu-satunya cara mengukur ambang kontak di pergelangan yang
+     * sebenarnya akan memakainya, dan ppg.h menunjuk ke baris ini.
+     *
+     * Dicetak SELALU, bukan hanya saat menempel: angka saat TIDAK menempel
+     * adalah setengah dari yang dibutuhkan. Baca IR di pergelangan dan di
+     * atas meja, lalu taruh PPG_IR_PRESENT di tengah keduanya. */
+    static uint32_t lastCalMs = 0;
 
-    if (millis() - lastPrintMs >= 500) {
-        lastPrintMs = millis();
+    /* PI dan R hanya lahir sekali per detik, saat satu jendela SpO2 selesai;
+     * baris ini dicetak dua kali sedetik. Tanpa menyimpannya, hampir setiap
+     * baris menampilkan 0,000 — dan pembacanya akan menyimpulkan sinyalnya
+     * mati padahal jendelanya cuma belum jatuh di sampel yang sama. */
+    static float lastPi = 0.0f;
+    static float lastR = 0.0f;
 
-        /* Dicetak SELALU, bukan hanya saat worn. Angka inilah yang diuji
-         * checkForBeat terhadap jendela 20..1000, jadi menyembunyikannya
-         * justru ketika sensor belum dianggap dipakai berarti menutup satu-
-         * satunya petunjuk kenapa ia belum dianggap dipakai. */
-        int ac = (int)(IR_AC_Max - IR_AC_Min);
+    if (o.spo2_ready) {
+        lastPi = o.pi;
+        lastR = o.r;
+    }
 
+    if (millis() - lastCalMs >= 500) {
+        lastCalMs = millis();
+
+        /* Umur angka tahanan ikut dicetak, dan itu bukan hiasan.
+         *
+         * Nilai tahanan sekarang bertahan selama gelang terpasang, tanpa
+         * batas waktu - jadi layar tidak bisa lagi membedakan denyut
+         * semenit lalu dari denyut sejam lalu. Baris ini bisa. Kalau
+         * `ditahan` terus bertambah sementara gelangnya jelas terpasang,
+         * itu berarti optiknya berhenti membaca dan angka di layar sudah
+         * jadi kenangan. */
         Serial.printf(
-            "[OPTIK] IR_mentah=%lu  dipakai=%s  sinyal=%u/15  "
-            "amplitudo_AC=%d (perlu 20..1000)\n",
-            (unsigned long)ir,
-            worn ? "YA" : "TIDAK",
-            signalQuality,
-            ac
+            "[CAL] IR=%lu  ambang=%.0f  dipakai=%s  kualitas=%u/15  "
+            "BPM=%.1f%s  tahan=%u(%lus)  PI=%.3f  R=%.4f\n",
+            (unsigned long)ppg.ir(),
+            (double)ppg.threshold(),
+            o.worn ? "YA" : "TIDAK",
+            o.quality,
+            (double)o.bpm,
+            o.bpm_valid ? "" : "(belum)",
+            heldBPM,
+            (unsigned long)(
+                heldAtMs == 0
+                ? 0
+                : (millis() - heldAtMs) / 1000u
+            ),
+            (double)lastPi,
+            (double)lastR
         );
     }
 #endif
@@ -811,46 +930,18 @@ static float rrVariability() {
 // PENGUMPULAN SAMPEL SPO2
 // =============================================================
 
-static void collectSpO2Sample(
-    uint32_t ir,
-    uint32_t red
-) {
-    if (
-        !spo2Collecting ||
-        spo2Filled >= SPO2_BUFFER_LEN
-    ) {
-        return;
-    }
-
-    spo2IrSum += ir;
-    spo2RedSum += red;
-    spo2AverageCount++;
-
-    if (
-        spo2AverageCount <
-        SPO2_AVERAGE_SAMPLES
-    ) {
-        return;
-    }
-
-    irBuf[spo2Filled] =
-        spo2IrSum /
-        SPO2_AVERAGE_SAMPLES;
-
-    redBuf[spo2Filled] =
-        spo2RedSum /
-        SPO2_AVERAGE_SAMPLES;
-
-    spo2Filled++;
-
-    spo2IrSum = 0;
-    spo2RedSum = 0;
-    spo2AverageCount = 0;
-}
 
 // =============================================================
 // TAMBAH DATA BLE VITAL
 // =============================================================
+
+/** Ada denyut yang layak ditampilkan. Terpasang dan pernah terukur; lihat
+ *  catatan di atas tentang apa yang sengaja TIDAK diperiksa di sini. */
+static bool heldFresh() {
+    return
+        worn &&
+        heldBPM > 0;
+}
 
 static void appendVitalSample(
     float bpm,
@@ -860,12 +951,31 @@ static void appendVitalSample(
         return;
     }
 
-    vitalsBatch[vitalsCount][0] =
+    uint8_t out =
         (uint8_t)(
             bpm > 255.0f
             ? 255
             : bpm
         );
+
+    /* Lubang terakhir yang membuat angkanya berkedip.
+     *
+     * Kedua pemanggil mengirim o.bpm tanpa memeriksa o.bpm_valid, jadi di
+     * detik-detik awal setelah kulit menyentuh sensor, denyut TERDETEKSI
+     * tetapi rata-ratanya belum jadi - dan yang terkirim adalah sampel
+     * SEGAR bernilai nol. Paketnya punya isi, jadi jalur tahanan tidak
+     * pernah dipakai, dan nol itu sampai ke layar sebagai "tidak ada
+     * denyut".
+     *
+     * Intervalnya tetap dikirim apa adanya: RR adalah pengukuran yang sah
+     * walau rata-rata denyutnya belum ada, dan HRV memakainya. Yang
+     * disubstitusi hanya angka denyutnya, dan paketnya mengaku. */
+    if (out == 0 && heldFresh()) {
+        out = heldBPM;
+        heldInBatch = true;
+    }
+
+    vitalsBatch[vitalsCount][0] = out;
 
     vitalsBatch[vitalsCount][1] =
         (uint8_t)(
@@ -888,67 +998,61 @@ static void handleSample(
     uint32_t ir,
     uint32_t red
 ) {
-    updateWornAndQuality(
-        ir
-    );
-
-    if (worn) {
-        collectSpO2Sample(
+    const PpgOut o =
+        ppg.feed(
             ir,
-            red
+            red,
+            millis()
+        );
+
+    applyPpg(o);
+
+    /* AGC memutuskan, .ino yang menulis. ppg.h sengaja tidak tahu apa-apa
+     * tentang MAX30105 — itu yang membuatnya bisa diuji di komputer. */
+    if (o.led_changed) {
+        maxSensor.setPulseAmplitudeRed(ppg.ledRed());
+        maxSensor.setPulseAmplitudeIR(ppg.ledIr());
+
+        Serial.printf(
+            "[AGC] arus LED disesuaikan: Red=0x%02X IR=0x%02X"
+            " (DC menyentuh atap ADC), menstabilkan ulang\n",
+            ppg.ledRed(),
+            ppg.ledIr()
         );
     }
 
-    // Detektor tetap menerima sampel saat sensor tidak dipakai
-    // agar filter DC internal tidak berhenti.
-    if (irBaseline == 0) {
-        irBaseline = ir;
+    /* Satu jendela SpO2 selesai. Gerbang kewajaran R dan PI sudah dilewati
+     * di dalam ppg.h, jadi apa pun yang sampai di sini layak dikirim —
+     * berbeda dari algoritma Maxim sebelumnya, yang menaikkan spo2Valid
+     * pada derau dan membuat saturasi terbaca 16% berjam-jam. */
+    if (o.spo2_ready) {
+        spo2Value =
+            (uint8_t)(o.spo2 + 0.5f);
+
+        spo2ValueValid = true;
+        lastSpo2WindowMs = millis();
     }
 
-    irBaseline +=
-        ((int32_t)ir - (int32_t)irBaseline) >>
-        BEAT_BASELINE_SHIFT;
-
-    int32_t beatInput =
-        (int32_t)BEAT_CENTRE +
-        ((int32_t)ir - (int32_t)irBaseline);
-
-    /* averageDCEstimator menerima uint16_t, jadi apa pun di atas 65535
-     * terpotong dan denyut palsu muncul dari luapan. */
-    if (beatInput < 0) {
-        beatInput = 0;
-    }
-    if (beatInput > 60000) {
-        beatInput = 60000;
-    }
-
-    bool beatDetected =
-        checkForBeat(
-            beatInput
-        );
-
-    if (
-        !worn ||
-        !beatDetected
-    ) {
+    if (!o.beat) {
         return;
     }
 
     uint32_t now =
         millis();
 
-    if (previousPeakMs == 0) {
+    uint32_t rawDelta =
+        o.rr_ms;
+
+    /* Denyut pertama satu sesi tidak punya pasangan, jadi tidak ada jarak
+     * untuk dinilai. ppg.h menandainya dengan rr_ms nol. */
+    if (rawDelta == 0) {
         previousPeakMs = now;
         return;
     }
 
-    uint32_t rawDelta =
-        now -
-        previousPeakMs;
+    previousPeakMs = now;
 
-    // Puncak terlalu dekat kemungkinan puncak palsu.
-    // previousPeakMs tidak diperbarui agar puncak berikutnya
-    // tetap dihitung dari puncak sebelumnya.
+    // Puncak terlalu rapat kemungkinan puncak palsu.
     if (rawDelta < cfg.rr_min_ms) {
         rrValid = false;
         lastRRms = 0;
@@ -962,11 +1066,9 @@ static void handleSample(
         return;
     }
 
-    // Interval terlalu panjang dipakai untuk sinkronisasi ulang,
-    // tetapi tidak dimasukkan ke BPM maupun riwayat RR.
+    // Terlalu renggang: dipakai untuk sinkronisasi ulang, tidak untuk BPM.
     if (rawDelta > cfg.rr_max_ms) {
-        resetVitalData();
-        previousPeakMs = now;
+        resyncRhythm();
 
 #if IR_CALIBRATION
         Serial.printf(
@@ -976,8 +1078,6 @@ static void handleSample(
 #endif
         return;
     }
-
-    previousPeakMs = now;
 
     bool signalValid =
         opticalQuality >=
@@ -1002,8 +1102,6 @@ static void handleSample(
         return;
     }
 
-    // Interval lolos pemeriksaan dasar dan boleh dipakai
-    // untuk memperbarui BPM.
     lastBeatMs = now;
 
     if (bpmBeatCount < 255) {
@@ -1011,28 +1109,54 @@ static void handleSample(
     }
 
     float bpm =
-        60000.0f /
-        (float)rawDelta;
-
-    avgBPM =
-        avgBPM < 1.0f
-        ? bpm
-        : (
-            avgBPM * 0.8f +
-            bpm * 0.2f
-        );
+        o.bpm;
 
     bool intervalValid =
         rrConsistentWithHistory(
             (uint16_t)rawDelta
         );
 
+    /* BPM hanya bergerak dari jarak yang SUDAH lolos pemeriksaan riwayat.
+     *
+     * Dulu baris ini ada di atas pemeriksaan itu, dan akibatnya terlihat di
+     * perangkat: detektor melewatkan satu denyut, jaraknya jadi dua kali
+     * lipat, dan rata-rata empat denyut di ppg.h ikut terseret — BPM
+     * tercetak 43,4 lalu 149,6 pada jari yang denyutnya sekitar 85. Jarak
+     * seperti itu memang sudah ditolak untuk dikirim sebagai RR, tapi
+     * angka BPM-nya terlanjur ikut tercemar sebelum penolakannya dibaca.
+     *
+     * Kalau sebuah jarak ditolak, BPM tidak bergerak sama sekali. Itu
+     * jawaban yang benar: kami tidak tahu, dan diam lebih baik daripada
+     * menebak. */
+    if (intervalValid) {
+        avgBPM =
+            avgBPM < 1.0f
+            ? bpm
+            : (
+                avgBPM * 0.8f +
+                bpm * 0.2f
+            );
+
+        /* Diambil dari rata-rata, bukan dari denyut tunggal yang baru
+         * masuk: yang ditahan nanti harus mewakili satu menit terakhir,
+         * bukan satu puncak terakhir. */
+        if (avgBPM >= 1.0f) {
+            heldBPM =
+                (uint8_t)(
+                    avgBPM > 255.0f
+                    ? 255
+                    : avgBPM
+                );
+
+            heldAtMs = now;
+        }
+    }
+
     if (!intervalValid) {
         rrValid = false;
         lastRRms = 0;
 
-        // BPM tetap dikirim, tetapi RR nol menandakan
-        // interval ini tidak boleh dipakai.
+        // BPM tetap dikirim; RR nol menandakan interval ini tidak dipakai.
         appendVitalSample(
             bpm,
             0
@@ -1097,97 +1221,45 @@ static void spo2Loop() {
         return;
     }
 
-    if (
-        !spo2Collecting &&
+    /* §3.2 mengirim saturasi setiap `spo2_sample_interval_s`, dan yang
+     * dikirim adalah jendela terbaru dari ppg.h.
+     *
+     * Dulu di sini ada mesin pengumpul: kumpulkan 100 sampel, panggil
+     * algoritma Maxim, nilai hasilnya. Semua itu hilang karena ppg.h sudah
+     * menghasilkan satu jendela per detik sepanjang kulit menempel — yang
+     * tersisa tinggal memutuskan kapan mengirimkannya.
+     *
+     * Jendela yang basi tidak dikirim. Saturasi dari dua menit lalu bukan
+     * saturasi sekarang, dan §3.2 tidak punya cara mengatakan "ini lama". */
+    const uint32_t now = millis();
+
+    if (now - lastSpo2Ms <
+        (uint32_t)cfg.spo2_sample_interval_s * 1000UL) {
+        return;
+    }
+
+    lastSpo2Ms = now;
+
+    const bool fresh =
+        spo2ValueValid &&
         worn &&
-        millis() - lastSpo2Ms >=
-            (uint32_t)
-            cfg.spo2_sample_interval_s *
-            1000UL
-    ) {
-        spo2Collecting = true;
-        spo2Filled = 0;
+        now - lastSpo2WindowMs <= SPO2_FRESH_MS;
 
-        spo2IrSum = 0;
-        spo2RedSum = 0;
-        spo2AverageCount = 0;
-
-        return;
-    }
-
-    if (
-        !spo2Collecting ||
-        spo2Filled < SPO2_BUFFER_LEN
-    ) {
-        return;
-    }
-
-    if (!worn) {
-        spo2Collecting = false;
-        spo2Filled = 0;
-
-        spo2IrSum = 0;
-        spo2RedSum = 0;
-        spo2AverageCount = 0;
-
+    if (!fresh) {
         spo2Value = 0;
         spo2ValueValid = false;
-        lastSpo2Ms = millis();
-
-        return;
     }
 
-    int32_t spo2 = 0;
-    int32_t hr = 0;
-
-    int8_t spo2Valid = 0;
-    int8_t hrValid = 0;
-
-    maxim_heart_rate_and_oxygen_saturation(
-        irBuf,
-        SPO2_BUFFER_LEN,
-        redBuf,
-        &spo2,
-        &spo2Valid,
-        &hr,
-        &hrValid
-    );
-
     Serial.printf(
-        "[SPO2] saturasi=%ld%%  sah=%s  denyut_versi_spo2=%ld  "
-        "sah=%s\n",
-        (long)spo2,
-        spo2Valid ? "YA" : "TIDAK",
-        (long)hr,
-        hrValid ? "YA" : "TIDAK"
+        "[SPO2] saturasi=%u%%  sah=%s\n",
+        spo2Value,
+        spo2ValueValid ? "YA" : "TIDAK"
     );
-
-    bool plausible =
-        spo2Valid &&
-        spo2 >= SPO2_PLAUSIBLE_MIN &&
-        spo2 <= 100;
-
-    spo2ValueValid =
-        plausible;
-
-    spo2Value =
-        plausible
-        ? (uint8_t)spo2
-        : 0;
 
     BLE_NotifyOxygen(
         spo2Value,
         bodyPosition
     );
-
-    spo2Collecting = false;
-    spo2Filled = 0;
-
-    spo2IrSum = 0;
-    spo2RedSum = 0;
-    spo2AverageCount = 0;
-
-    lastSpo2Ms = millis();
 }
 
 // =============================================================
@@ -1363,8 +1435,27 @@ static void motionLoop() {
 // DETEKSI ANOMALI
 // =============================================================
 
+/* Sejak kapan keadaan di luar ambang bertahan tanpa putus. 0 = tidak ada. */
+static uint32_t anomalySinceMs = 0;
+
 static void anomalyLoop() {
-    if (!bpmIsValid()) {
+    /* Dimatikan dari aplikasi. Tangga yang sedang berjalan ikut diturunkan,
+     * kalau tidak sakelarnya hanya mencegah alarm BERIKUTNYA dan
+     * meninggalkan yang sekarang berbunyi tanpa penjelasan. */
+    if (!cfg.anomaly_enabled) {
+        anomalySinceMs = 0;
+        ladder.clear(millis());
+        return;
+    }
+
+    /* Kualitas sinyal ikut jadi syarat.
+     *
+     * bpmIsValid() menjawab "angkanya ada", bukan "angkanya layak dipercaya
+     * untuk membangunkan orang". Gelang yang longgar tetap menghasilkan
+     * angka; angka itu yang bergoyang. Keputusan ini menuntut sinyal yang
+     * benar-benar bagus, dan diam saat sensornya sedang ragu. */
+    if (!bpmIsValid() || signalQuality < cfg.anomaly_min_quality) {
+        anomalySinceMs = 0;
         ladder.clear(
             millis()
         );
@@ -1392,17 +1483,28 @@ static void anomalyLoop() {
         rrVariability() >
             cfg.rr_variability_threshold;
 
-    if (outOfBand) {
-        ladder.anomaly(
-            millis(),
-            REASON_THRESHOLD
-        );
-    } else if (irregular) {
-        ladder.anomaly(
-            millis(),
-            REASON_IRREGULAR
-        );
+    /* Harus bertahan, bukan sekadar terjadi.
+     *
+     * Jam mulai dipasang pada sampel pertama yang di luar ambang dan
+     * dihapus oleh sampel pertama yang kembali normal, jadi apa pun yang
+     * berkedip-kedip tidak pernah sampai ke tangga. Yang lolos hanyalah
+     * keadaan yang bertahan penuh selama anomaly_hold_s. */
+    if (outOfBand || irregular) {
+        if (anomalySinceMs == 0) {
+            anomalySinceMs = millis();
+        }
+
+        uint32_t held_s =
+            (millis() - anomalySinceMs) / 1000u;
+
+        if (held_s >= cfg.anomaly_hold_s) {
+            ladder.anomaly(
+                millis(),
+                outOfBand ? REASON_THRESHOLD : REASON_IRREGULAR
+            );
+        }
     } else {
+        anomalySinceMs = 0;
         ladder.clear(
             millis()
         );
@@ -1495,17 +1597,34 @@ static void vitalsLoop() {
 
     uint8_t packet[16];
 
-    packet[0] =
-        (uint8_t)(
-            (worn ? 0x80 : 0x00) |
-            (signalQuality & 0x0F)
-        );
-
     uint8_t count =
         vitalsCount;
 
+    /* Tidak ada sampel segar siklus ini. Dulu yang terkirim nol, dan nol
+     * di layar berarti "tidak ada denyut" - padahal yang benar adalah
+     * "belum ada yang baru". §3.1 bit 6 menyatakan bedanya, jadi penerima
+     * boleh menampilkannya dan tetap menolak memakainya untuk keputusan. */
+    bool holding =
+        heldInBatch ||
+        (count == 0 && heldFresh());
+
+    heldInBatch = false;
+
+    packet[0] =
+        (uint8_t)(
+            (worn ? 0x80 : 0x00) |
+            (holding ? 0x40 : 0x00) |
+            (signalQuality & 0x0F)
+        );
+
     if (count == 0) {
-        packet[1] = 0;
+        packet[1] =
+            holding
+            ? heldBPM
+            : 0;
+
+        /* RR tetap nol apa pun keadaannya. Satu interval adalah pengukuran
+         * satu peristiwa; ia tidak punya versi yang diingat. */
         packet[2] = 0;
         packet[3] = 0;
 
@@ -1936,6 +2055,18 @@ static void onConfig(
         document["rr_max_ms"] |
         cfg.rr_max_ms;
 
+    cfg.anomaly_hold_s =
+        document["anomaly_hold_s"] |
+        cfg.anomaly_hold_s;
+
+    cfg.anomaly_min_quality =
+        document["anomaly_min_quality"] |
+        cfg.anomaly_min_quality;
+
+    cfg.anomaly_enabled =
+        document["anomaly_enabled"] |
+        cfg.anomaly_enabled;
+
     cfg.rr_min_quality =
         document["rr_min_quality"] |
         cfg.rr_min_quality;
@@ -1968,6 +2099,10 @@ static void onConfig(
         document["motion_response_threshold_mg"] |
         ladder.cfg.motion_response_mg;
 
+    ladder.cfg.standdown_cooldown_s =
+        document["standdown_cooldown_s"] |
+        ladder.cfg.standdown_cooldown_s;
+
     // Perlindungan konfigurasi tidak masuk akal.
     if (cfg.spo2_sample_interval_s < 10) {
         cfg.spo2_sample_interval_s = 10;
@@ -1983,6 +2118,17 @@ static void onConfig(
 
     if (cfg.rr_min_quality > 15) {
         cfg.rr_min_quality = 15;
+    }
+
+    if (cfg.anomaly_min_quality > 15) {
+        cfg.anomaly_min_quality = 15;
+    }
+
+    /* Tanpa batas atas, satu nilai salah dari aplikasi membuat gelang diam
+     * sepanjang malam tanpa ada yang tahu. Lima menit sudah jauh lebih
+     * lama daripada yang masuk akal untuk dipertahankan. */
+    if (cfg.anomaly_hold_s > 300) {
+        cfg.anomaly_hold_s = 300;
     }
 
     if (
@@ -2001,11 +2147,6 @@ static void onConfig(
 static void onCommand(
     const char *json
 ) {
-    Serial.printf(
-        "[CMD] %s\n",
-        json
-    );
-
     JsonDocument document;
 
     if (
@@ -2014,8 +2155,9 @@ static void onCommand(
             json
         )
     ) {
-        Serial.println(
-            "[CMD] JSON tidak valid"
+        Serial.printf(
+            "[CMD] JSON tidak valid: %s\n",
+            json
         );
 
         return;
@@ -2023,6 +2165,33 @@ static void onCommand(
 
     const char *command =
         document["cmd"] | "";
+
+    // §2.1 heartbeat. Kedatangannya sudah dicatat ble_band.cpp; di sini
+    // cukup tidak mengotori log setiap 10 detik.
+    if (!strcmp(
+            command,
+            "ping"
+        )) {
+        return;
+    }
+
+    Serial.printf(
+        "[CMD] %s\n",
+        json
+    );
+
+    // §3.8. Satu-satunya jalan keluar dari tahap 4. escalationLoop yang
+    // melaporkan tahap 0 lewat Indicate dan siaran, seperti transisi lain.
+    if (!strcmp(
+            command,
+            "stand_down"
+        )) {
+        ladder.reset(
+            millis()
+        );
+
+        return;
+    }
 
     if (!strcmp(
             command,
@@ -2108,43 +2277,27 @@ static void onCommand(
 }
 
 // =============================================================
-// UART ESP32-C3 -> ESP32-C6
+// LOG SERIAL
 // =============================================================
 
 /*
- * Format:
- *
- * RP,
- * bpm,
- * rr_ms,
- * spo2,
- * motion_mg,
- * position,
- * worn,
- * quality,
- * stage,
- * reason,
- * battery,
- * ble_link,
- * bpm_valid,
- * rr_valid,
- * spo2_valid
- *
- * Contoh:
- *
- * RP,81,752,97,92,0,1,15,0,0,255,0,1,1,1
+ * Satu baris per detik ke USB serial. Dulu fungsi ini juga mengirim baris
+ * "RP,81,752,97,..." lewat UART1 ke layar ESP32-C6 — empat belas angka
+ * telanjang yang dihitung parser layar berdasarkan komanya. Rangkaian final
+ * tidak punya layar, jadi yang tersisa hanya versi berlabel untuk mata
+ * manusia. Angka yang sama tetap pergi ke aplikasi lewat BLE.
  */
 
-static void c6Loop() {
+static void logLoop() {
     if (
         millis() -
-        lastC6Ms <
-        C6_INTERVAL_MS
+        lastLogMs <
+        LOG_INTERVAL_MS
     ) {
         return;
     }
 
-    lastC6Ms = millis();
+    lastLogMs = millis();
 
     bool bpmValid =
         bpmIsValid();
@@ -2171,37 +2324,7 @@ static void c6Loop() {
         ? spo2Value
         : 0;
 
-    char line[128];
-
-    snprintf(
-        line,
-        sizeof(line),
-        "RP,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u",
-        (unsigned)bpm,
-        (unsigned)rr,
-        (unsigned)spo2,
-        (unsigned)motionMilliG,
-        (unsigned)bodyPosition,
-        worn ? 1U : 0U,
-        (unsigned)signalQuality,
-        (unsigned)ladder.stage(),
-        (unsigned)ladder.reason(),
-        (unsigned)batteryPercent(),
-        BLE_Connected() ? 1U : 0U,
-        bpmValid ? 1U : 0U,
-        currentRRValid ? 1U : 0U,
-        spo2ValueValid ? 1U : 0U
-    );
-
-    C6.println(
-        line
-    );
-
 #if SERIAL_HEARTBEAT
-    /* Baris "RP,..." di atas adalah untuk jam tangan, bukan untuk mata
-     * manusia: empat belas angka telanjang tanpa satu pun label. Yang
-     * dikirim ke jam tetap apa adanya karena parsernya menghitung koma;
-     * yang dicetak ke serial monitor adalah versi berlabelnya. */
     char batt[8];
 
     uint8_t pct = batteryPercent();
@@ -2297,24 +2420,9 @@ void setup() {
         F("\n=== RePulse Band ESP32-C3 ===")
     );
 
-    C6.begin(
-        C6_BAUD,
-        SERIAL_8N1,
-        PIN_UART_IN,
-        PIN_UART_OUT
-    );
-
     pinMode(
         PIN_BUTTON,
         INPUT_PULLUP
-    );
-
-    attachInterrupt(
-        digitalPinToInterrupt(
-            PIN_BUTTON
-        ),
-        buttonISR,
-        CHANGE
     );
 
     ledcAttach(
@@ -2394,5 +2502,5 @@ void loop() {
     offlineSummaryLoop();
     flushLoop();
 
-    c6Loop();
+    logLoop();
 }

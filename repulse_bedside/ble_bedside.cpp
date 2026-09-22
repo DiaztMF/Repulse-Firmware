@@ -12,6 +12,13 @@
 static BedsideCallbacks g_cb        = {};
 static NimBLEServer    *g_server    = nullptr;
 static bool             g_connected = false;
+
+/* §2.1 aplikasi hidup: tersambung DAN ada tulisan dalam 30 detik terakhir.
+ * HP yang layarnya mati tetap tersambung tapi tidak bisa memerintah apa pun
+ * — tanpa ini syarat 3 menahan sirene demi aplikasi yang tuli. */
+#define APP_TIMEOUT_MS  30000UL
+static uint32_t g_app_seen_ms = 0;
+static void appSeen() { g_app_seen_ms = millis(); }
 static Preferences      g_prefs;
 static String           g_paired_mac;
 
@@ -23,6 +30,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
         (void)server;
         g_connected = true;
+        appSeen();   // attach butuh waktu sebelum ping pertama
         Serial.printf("[BLE] Aplikasi tersambung: %s\n",
                       info.getAddress().toString().c_str());
     }
@@ -37,6 +45,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 class ActuatorCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
         (void)info;
+        appSeen();
         if (g_cb.onActuator) g_cb.onActuator(c->getValue().c_str());
     }
 };
@@ -159,12 +168,30 @@ void BLE_Init(const BedsideCallbacks &cb) {
      * Setengah jendela menyisakan separuh waktu untuk iklan. Deteksi tahap
      * eskalasi tetap jauh di bawah batas 2 detik §2.1: gelang menyiarkan
      * berkali-kali per detik, jadi kehilangan separuhnya hanya menggandakan
-     * waktu tunggu rata-rata dari milidetik ke milidetik. */
+     * waktu tunggu rata-rata dari milidetik ke milidetik.
+     *
+     * Seperempat jendela, bukan setengah, sejak website ikut menyambung.
+     *
+     * Chrome tidak memindai terus-menerus seperti aplikasi. Pemilih
+     * perangkatnya membuka satu jendela pemindaian, dan apa pun yang tidak
+     * mengiklan di dalam jendela itu tidak masuk daftar. Bedside yang bisu
+     * separuh waktu muncul kira-kira dua kali lebih lambat dari gelang,
+     * yang mengiklan penuh waktu karena tidak memindai apa pun - dan di
+     * dialog yang ditunggu orang sambil menatapnya, selisih itu terasa.
+     *
+     * Jendelanya tetap 50 ms; yang melebar hanya jeda antar jendela, dari
+     * 50 ms ke 150 ms. Jadi iklan dapat 75% waktu udara, bukan 50%. Batas
+     * 2 detik §2.1 masih longgar: 50 ms mendengar setiap 200 ms terhadap
+     * gelang yang menyiarkan berkali-kali per detik tetap menangkapnya
+     * dalam ratusan milidetik.
+     *
+     * Kalau suatu hari deteksi tahap terasa lambat, INI knob pertama yang
+     * dikembalikan - turunkan interval, bukan lebarkan window. */
     g_scan = NimBLEDevice::getScan();
     g_scan->setScanCallbacks(new ScanCallbacks(), false);
     g_scan->setActiveScan(true);
-    g_scan->setInterval(160);            // 100 ms
-    g_scan->setWindow(80);               // 50 ms mendengar, 50 ms bebas mengiklan
+    g_scan->setInterval(320);            // 200 ms
+    g_scan->setWindow(80);               // 50 ms mendengar, 150 ms bebas mengiklan
     g_scan->start(0, false, true);
 
     /* Tanggal build, supaya "sudah kau flash belum?" berhenti jadi
@@ -174,6 +201,10 @@ void BLE_Init(const BedsideCallbacks &cb) {
 }
 
 bool BLE_Connected() { return g_connected; }
+
+bool BLE_AppAlive() {
+    return g_connected && millis() - g_app_seen_ms < APP_TIMEOUT_MS;
+}
 
 // ─── Notify / Indicate ───────────────────────────────────────
 

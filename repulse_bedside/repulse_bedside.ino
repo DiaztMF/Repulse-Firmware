@@ -54,10 +54,10 @@
 #define PIN_MIC_DIN        6    // INMP441 SD / DOUT
 
 #define PIN_I2C_SCL        7    // BH1750
-#define PIN_I2C_SDA        9    // BH1750 — strapping pin, lihat catatan bawah
+#define PIN_I2C_SDA        1    // BH1750 — dipindah dari GPIO9 (strapping), lihat catatan bawah
 
 #define PIN_LED            8    // WS2812 DIN — strapping pin, lihat catatan
-#define PIN_DHT           10    // DHT11 DATA, pull-up 10k ke 3V3
+#define PIN_DHT           10     // DHT11 DATA, pull-up 10k ke 3V3
 
 #define PIN_DFPLAYER_RX    2    // ke TX DFPlayer
 #define PIN_DFPLAYER_TX    3    // ke RX DFPlayer, lewat resistor 1k
@@ -97,8 +97,17 @@
 #define AROMA_ACTIVE_LEVEL HIGH
 
 /* ⚠ CATATAN STRAPPING PIN ESP32-C3: GPIO2, GPIO8, dan GPIO9 ikut menentukan
- * mode boot. GPIO9 aman karena pull-up I2C BH1750 menahannya HIGH. GPIO8
- * (WS2812 DIN) dan GPIO2 (RX dari DFPlayer) mengambang saat boot — pasang
+ * mode boot.
+ *
+ * GPIO9 sengaja DIKOSONGKAN. SDA BH1750 dulu di sini dengan anggapan pull-up
+ * modul menahannya HIGH — sampai suatu hari papan diam total: LED biru mati,
+ * serial kosong, padahal papan tanpa sensor dengan kode yang sama normal.
+ * esptool tersambung tanpa reset dan GPIO_STRAP_REG (0x60004038) terbaca
+ * 0x5: bit 3 = GPIO9 = 0, chip masuk mode download. Modul yang VCC-nya
+ * kendor atau rusak menarik SDA ke GND, dan tidak ada satu baris kode pun
+ * yang sempat jalan untuk melaporkannya. GPIO1 bukan strapping pin.
+ *
+ * GPIO8 (WS2812 DIN) dan GPIO2 (RX dari DFPlayer) mengambang saat boot — pasang
  * resistor pull-up 10k ke 3V3 di keduanya, supaya papan tidak gagal boot
  * tergantung modul mana yang menyala lebih dulu. */
 
@@ -217,18 +226,29 @@ static uint32_t lastBandSeenMs = 0;
 //  Lampu
 // ═══════════════════════════════════════════════════════════════
 
+/* §4.3 light.rgb terakhir. Tanpanya warna dihitung dari lightKelvin. */
+static bool lightHasRgb = false;
+static Rgb  lightRgb    = { 0, 0, 0 };
+
 static void lightApply(uint8_t brightness) {
-    Rgb c = light_color(lightMode, lightKelvin, brightness);
+    Rgb c = light_color(lightMode, lightKelvin, brightness,
+                        lightHasRgb ? &lightRgb : nullptr);
     for (uint16_t i = 0; i < LED_COUNT; i++) strip.setPixelColor(i, c.r, c.g, c.b);
     strip.show();
 }
 
-static void lightSet(const char *mode, uint16_t kelvin, uint8_t brightness, uint32_t ramp_s) {
+static void lightSet(const char *mode, uint16_t kelvin, uint8_t brightness, uint32_t ramp_s,
+                     const Rgb *rgb) {
     strncpy(lightMode, mode, sizeof(lightMode) - 1);
     lightMode[sizeof(lightMode) - 1] = '\0';
     lightKelvin  = kelvin;
-    lightFrom    = lightTo;
-    lightTo      = brightness > LED_MAX_BRIGHTNESS ? LED_MAX_BRIGHTNESS : brightness;
+    lightHasRgb  = rgb != nullptr;
+    if (rgb) lightRgb = *rgb;
+    uint8_t target = brightness > LED_MAX_BRIGHTNESS ? LED_MAX_BRIGHTNESS : brightness;
+    // Sunset berangkat dari `target` dan berakhir gelap; lihat light.h.
+    LightRamp ends = light_endpoints(lightMode, lightTo, target, ramp_s);
+    lightFrom    = ends.from;
+    lightTo      = ends.to;
     lightStartMs = millis();
     lightRampMs  = ramp_s * 1000u;
     if (lightRampMs == 0) lightApply(lightTo);
@@ -419,13 +439,16 @@ static void noiseCancel(uint8_t volNowOnModule) {
 static void noiseSet(bool on, uint8_t level0_3, uint8_t track, uint16_t fade_s) {
     if (!dfReady) return;
     if (level0_3 > 3) level0_3 = 3;
+    /* Hanya 0001-0003. Track 4 adalah sirene — tanpa batas ini perintah
+     * white noise yang salah membunyikan sirene pada volume comfort. */
+    if (track < 1 || track > 3) track = 1;
     uint8_t target = on ? (uint8_t)(level0_3 * 10) : 0;
 
     if (on && !noiseOn) {
         /* Mulai dari senyap, lalu naik. Menyalakan trek dulu pada volume
          * lama berarti satu ketukan keras sebelum fade sempat mulai. */
         noiseApply(0);
-        dfPlayLooping(TRACK_WHITE_NOISE_BASE + (track > 0 ? track : 1) - 1);
+        dfPlayLooping(TRACK_WHITE_NOISE_BASE + track - 1);
     }
 
     noiseOn        = on;
@@ -531,20 +554,29 @@ static void aromaLoop() {
 // ═══════════════════════════════════════════════════════════════
 
 static void onActuator(const char *json) {
-    Serial.printf("[ACT] %s\n", json);
-
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
-        Serial.println("[ACT] JSON tidak valid");
+        Serial.printf("[ACT] JSON tidak valid: %s\n", json);
         return;
     }
+    /* §4.3 heartbeat. ble_bedside.cpp sudah mencatat kedatangannya. Tanpa
+     * command_id tidak ada yang dikonfirmasi, dan membalas 0004 tiap 10
+     * detik hanya mengotori log kedua pihak. */
+    if (doc["ping"] | false) return;
+
+    Serial.printf("[ACT] %s\n", json);
     uint8_t command_id = doc["command_id"] | 0;
     uint8_t status     = 0;                       // §4.4: 0 selesai
 
     if (doc["light"].is<JsonObject>()) {
         JsonObject l = doc["light"];
+        /* §4.3 light.rgb, opsional. Tanpa tepat tiga angka, warna datang
+         * dari kelvin seperti sebelumnya. */
+        JsonArray rgb = l["rgb"];
+        Rgb custom = { (uint8_t)(rgb[0] | 0), (uint8_t)(rgb[1] | 0), (uint8_t)(rgb[2] | 0) };
         lightSet(l["mode"] | "off", l["kelvin"] | 2700,
-                 l["brightness"] | 0, l["ramp_s"] | 0);
+                 l["brightness"] | 0, l["ramp_s"] | 0,
+                 rgb.size() == 3 ? &custom : nullptr);
     }
 
     if (doc["white_noise"].is<JsonObject>()) {
@@ -563,8 +595,31 @@ static void onActuator(const char *json) {
         JsonObject a = doc["aroma"];
         uint16_t seconds = a["duration_s"] | 0;
 
+        bool hold = a["hold"] | false;
+
         if (!(a["on"] | false)) {
             aromaOff();
+        } else if (hold) {
+            /* Mode uji panel — §4.3 diperlonggar DENGAN SENGAJA.
+             *
+             * Batas 30 detik dan kuota 4 kejadian menjaga tidur seseorang,
+             * bukan menjaga perangkatnya. Saat teknisi sedang menguji arah
+             * semburan, polaritas relay, atau isi tangki, batas itu hanya
+             * memaksa dia menekan tombol berulang kali dan tidak melindungi
+             * siapa pun — tidak ada yang sedang tidur di ruangan itu.
+             *
+             * Satu-satunya jalan mematikannya adalah perintah on=false.
+             * aromaOffAtMs = 0 berarti aromaLoop tidak akan pernah
+             * mematikannya sendiri. Jalur otomatis TIDAK PERNAH mengirim
+             * hold, jadi §5.3 tetap berlaku penuh untuk setiap intervensi. */
+            if (PIN_AROMA < 0) {
+                status = 1;
+                Serial.println("[AROMA] tidak ada pin kendali — perintah gagal");
+            } else {
+                digitalWrite(PIN_AROMA, AROMA_ACTIVE_LEVEL);
+                aromaOffAtMs = 0;
+                Serial.println("[AROMA] MODE UJI — nyala sampai dimatikan, kuota tidak terpakai");
+            }
         } else if (seconds == 0 || seconds > AROMA_MAX_SECONDS) {
             /* §4.3: permintaan yang melampaui batas dibalas status = 2, BUKAN
              * diam-diam dijalankan lebih pendek. Uji §6 no. 4 memang dirancang
@@ -613,14 +668,22 @@ static void onBandSeen(uint8_t stage, bool phone_connected, bool paired) {
 
     bool should_sound = stage >= 3            // 1
                      && paired                // 2
-                     && !BLE_Connected()      // 3
+                     && !BLE_AppAlive()       // 3 — hidup, bukan sekadar tersambung
                      && !phone_connected;     // 4
 
     if (should_sound && !sirenOn) {
         sirenSet(true, true);
-    } else if (!should_sound && sirenOn && sirenIsOurs) {
-        // Hanya sirene yang kita nyalakan sendiri yang boleh kita matikan
-        // sendiri. Sirene atas perintah aplikasi tetap milik aplikasi.
+    } else if (!should_sound && sirenOn && (sirenIsOurs || !BLE_AppAlive())) {
+        /* Sirene yang kita nyalakan sendiri boleh kita matikan sendiri.
+         *
+         * Sirene atas perintah aplikasi juga — TAPI hanya setelah
+         * aplikasinya tidak hidup lagi. Sebelumnya syaratnya sirenIsOurs
+         * saja, dan itu meninggalkan satu keadaan yang tidak punya jalan
+         * keluar sama sekali: aplikasi menyalakan sirene di SOS_SENT lalu
+         * mati atau kehilangan koneksi. Pemiliknya sudah tidak ada, aturan
+         * §2.1 menolak mematikan milik orang lain, dan sirene berbunyi
+         * sampai listriknya dicabut. Selama aplikasi masih hidup, aplikasi
+         * tetap berkuasa penuh. */
         sirenSet(false, false);
     }
 }
@@ -794,9 +857,34 @@ void setup() {
     strip.clear();
     strip.show();
 
+    /* Level jalur SEBELUM Wire mengambilnya. Pull-up di modul BH1750 harus
+     * menahan keduanya HIGH; LOW berarti VCC modul tidak sampai, modul rusak,
+     * atau kabel menyentuh GND — kegagalan yang dulu menjebak papan di mode
+     * download saat SDA masih di GPIO9. "TIDAK DITEMUKAN" saja tidak bisa
+     * membedakan itu dari alamat yang salah. */
+    pinMode(PIN_I2C_SDA, INPUT);
+    pinMode(PIN_I2C_SCL, INPUT);
+    delay(5);
+    Serial.printf("[I2C] SDA(GPIO%d)=%s SCL(GPIO%d)=%s\n",
+                  PIN_I2C_SDA, digitalRead(PIN_I2C_SDA) ? "HIGH" : "LOW",
+                  PIN_I2C_SCL, digitalRead(PIN_I2C_SCL) ? "HIGH" : "LOW");
+
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    bh1750Ready = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+    /* 0x23 bila kaki ADDR modul LOW atau mengambang, 0x5C bila HIGH. */
+    bh1750Ready = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23) ||
+                  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C);
     Serial.printf("[BH1750] %s\n", bh1750Ready ? "OK" : "TIDAK DITEMUKAN");
+    if (!bh1750Ready) {
+        // Siapa pun yang menjawab di bus. Kosong berarti tidak ada perangkat
+        // I2C yang hidup di kabel ini sama sekali — cari di daya dan kabel.
+        String found;
+        for (uint8_t a = 0x08; a < 0x78; a++) {
+            Wire.beginTransmission(a);
+            if (Wire.endTransmission() == 0) found += " 0x" + String(a, HEX);
+        }
+        Serial.printf("[I2C] alamat yang menjawab:%s\n",
+                      found.length() ? found.c_str() : " TIDAK ADA");
+    }
 
     dht.begin();
 
@@ -861,9 +949,14 @@ void loop() {
     alertFlashLoop();
     BLE_ScanLoop();
 
-    /* Gelang menghilang dari udara sama sekali. Sirene mandiri dimatikan —
-     * tanpa siaran, syarat 1 dan 2 di §2.1 tidak bisa dibuktikan lagi. */
-    if (sirenIsOurs && millis() - lastBandSeenMs > 15000) {
+    /* Gelang menghilang dari udara sama sekali. Sirene dimatikan — tanpa
+     * siaran, syarat 1 dan 2 di §2.1 tidak bisa dibuktikan lagi.
+     *
+     * Termasuk sirene perintah aplikasi bila aplikasinya juga sudah tidak
+     * hidup: tidak ada gelang, tidak ada aplikasi, tidak ada satu pun yang
+     * masih bisa mengatakan keadaan daruratnya masih berlangsung. */
+    if (sirenOn && (sirenIsOurs || !BLE_AppAlive()) &&
+        millis() - lastBandSeenMs > 15000) {
         sirenSet(false, false);
     }
 }

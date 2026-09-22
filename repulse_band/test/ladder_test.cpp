@@ -111,6 +111,57 @@ int main() {
     test_buffer_keeps_data_until_ack();
     test_buffer_survives_dropped_flush();
     test_buffer_overwrites_oldest_when_full();
+    // --- "saya baik-baik saja" harus benar-benar menghentikannya ---------
+    {
+        /* Tanpa jeda, tangga naik lagi pada iterasi loop BERIKUTNYA, karena
+         * keadaan yang memicunya masih sama persis. Di perangkat itu terasa
+         * sebagai layar darurat yang muncul lagi sedetik setelah ditolak —
+         * berulang-ulang, sepanjang denyutnya masih di luar ambang. */
+        Ladder l;
+        uint32_t t = 10000;
+
+        l.anomaly(t, REASON_THRESHOLD);
+        assert(l.stage() == 1);
+
+        l.reset(t);                       // "saya baik-baik saja"
+        assert(l.stage() == 0);
+
+        /* Anomali yang sama, semilidetik kemudian. Harus diabaikan. */
+        l.anomaly(t + 1, REASON_THRESHOLD);
+        assert(l.stage() == 0 && "tidak boleh langsung naik lagi");
+
+        /* Masih dijeda satu detik sebelum habis. */
+        const uint32_t cooldown_ms = 180u * 1000u;
+        l.anomaly(t + cooldown_ms - 1000, REASON_THRESHOLD);
+        assert(l.stage() == 0 && "masih di dalam jeda");
+
+        /* Sesudah jedanya habis, ia harus bekerja lagi — jeda yang tidak
+         * pernah berakhir adalah fitur keselamatan yang dimatikan. */
+        l.anomaly(t + cooldown_ms + 1, REASON_THRESHOLD);
+        assert(l.stage() == 1 && "jeda harus berakhir");
+    }
+
+    // --- tombol SOS menembus jeda ----------------------------------------
+    {
+        /* Jeda yang bisa menghalangi seseorang meminta tolong bukan jeda,
+         * itu kerusakan. */
+        Ladder l;
+        uint32_t t = 10000;
+
+        l.anomaly(t, REASON_THRESHOLD);
+        l.reset(t);
+        assert(l.stage() == 0);
+
+        l.manualSos(t + 1);
+        assert(l.stage() == 4 && "SOS tidak pernah dijeda");
+        assert(l.reason() == REASON_MANUAL);
+
+        /* Dan jedanya ikut hilang, supaya sesudahnya semuanya normal lagi. */
+        l.reset(t + 2);
+        l.manualSos(t + 3);
+        assert(l.stage() == 4);
+    }
+
     printf("ladder + evtbuf: semua cek lulus\n");
     return 0;
 }

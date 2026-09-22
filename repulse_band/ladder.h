@@ -25,6 +25,22 @@ struct LadderConfig {
     uint16_t stage1_s = 20;
     uint16_t stage2_s = 15;
     uint16_t stage3_s = 30;
+    /* Berapa lama anomali diabaikan setelah seseorang menekan "saya
+     * baik-baik saja".
+     *
+     * Tanpa ini tangga langsung naik lagi pada iterasi loop berikutnya —
+     * dalam hitungan milidetik — karena keadaan yang memicunya (denyut di
+     * luar ambang) masih sama persis. Orangnya menekan tombol, layarnya
+     * hilang sekejap, lalu kembali. Berulang-ulang.
+     *
+     * Hanya berlaku untuk penolakan yang DISENGAJA oleh manusia. Anomali
+     * yang hilang sendiri (clear) dan yang dibatalkan gerakan tubuh
+     * (motion) tidak mendapat jeda ini — keduanya bukan pernyataan.
+     *
+     * Tombol SOS menembusnya tanpa syarat. Jeda yang bisa menghalangi
+     * seseorang meminta tolong bukan jeda, itu kerusakan. */
+    uint16_t standdown_cooldown_s = 180;
+
     // Gerakan di atas ini saat tahap >= 2 berarti tubuh merespons.
     // ponytail: satu ambang global; jadikan per-pengguna kalau kalibrasi
     // menunjukkan orang tidur gelisah memicu batal terus.
@@ -47,12 +63,26 @@ public:
      * sudah jalan tidak me-restart timer. */
     void anomaly(uint32_t now_ms, uint8_t reason) {
         if (stage_ != 0) return;
+        if (muted(now_ms)) return;
         set(1, reason, now_ms);
+    }
+
+    /* Masih dalam jeda setelah seseorang menyatakan dirinya baik-baik saja? */
+    bool muted(uint32_t now_ms) const {
+        return muted_until_ms_ != 0 &&
+               (int32_t)(muted_until_ms_ - now_ms) > 0;
+    }
+
+    /* Sisa jeda dalam detik, untuk dicetak. 0 kalau tidak sedang dijeda. */
+    uint16_t muteLeft_s(uint32_t now_ms) const {
+        if (!muted(now_ms)) return 0;
+        return (uint16_t)((muted_until_ms_ - now_ms) / 1000u);
     }
 
     /* Tombol SOS. Langsung tahap 4 — pengguna sudah minta tolong, tidak ada
      * yang perlu dikonfirmasi selama 65 detik. */
     void manualSos(uint32_t now_ms) {
+        muted_until_ms_ = 0;   // permintaan tolong tidak pernah dijeda
         set(4, REASON_MANUAL, now_ms);
     }
 
@@ -81,15 +111,22 @@ public:
         if (elapsed_s >= limit) set(stage_ + 1, reason_, now_ms);
     }
 
-    /* Aplikasi menutup kejadian. */
+    /* Aplikasi menutup kejadian — seseorang menekan "saya baik-baik saja".
+     *
+     * Jedanya dipasang di sini dan hanya di sini. Ini satu-satunya jalan
+     * masuk yang berarti sebuah PERNYATAAN dari manusia, dan pernyataan itu
+     * layak dipercaya untuk beberapa menit ke depan. */
     void reset(uint32_t now_ms) {
         if (stage_ != 0) set(0, REASON_NONE, now_ms);
+        muted_until_ms_ = now_ms + (uint32_t)cfg.standdown_cooldown_s * 1000u;
+        if (muted_until_ms_ == 0) muted_until_ms_ = 1;   // 0 berarti "tidak dijeda"
     }
 
 private:
     uint8_t  stage_      = 0;
     uint8_t  reason_     = REASON_NONE;
     uint32_t entered_ms_ = 0;
+    uint32_t muted_until_ms_ = 0;
     bool     changed_    = false;
 
     void set(uint8_t stage, uint8_t reason, uint32_t now_ms) {

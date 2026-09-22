@@ -21,6 +21,9 @@ struct BedsideCallbacks {
 
 void BLE_Init(const BedsideCallbacks &cb);
 bool BLE_Connected();
+/* §2.1. Tersambung dan menulis sesuatu dalam 30 detik terakhir. Syarat 3
+ * sirene mandiri memakai ini, bukan BLE_Connected. */
+bool BLE_AppAlive();
 
 void BLE_NotifyRoom(int16_t temp_c_x10, uint16_t rh_pct_x10,
                     uint32_t lux_x100, uint8_t db);              // §4.1

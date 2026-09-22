@@ -13,6 +13,14 @@ static NimBLEServer       *g_server    = nullptr;
 static NimBLEAdvertising  *g_adv       = nullptr;
 static bool                g_connected = false;
 
+/* §2.1 aplikasi hidup: tersambung DAN ada tulisan dalam 30 detik terakhir.
+ * Android membekukan JavaScript aplikasi saat layar mati tapi koneksi GATT
+ * tetap dipegang native — tanpa ini bit phone_connected bilang "ada HP"
+ * padahal HP-nya tuli, dan bedside ikut diam. */
+#define APP_TIMEOUT_MS  30000UL
+static uint32_t g_app_seen_ms = 0;
+static void appSeen() { g_app_seen_ms = millis(); }
+
 static NimBLECharacteristic *c_vitals, *c_oxygen, *c_motion, *c_sos,
                             *c_config, *c_buffer, *c_escalation,
                             *c_status, *c_command, *c_ecg;
@@ -29,6 +37,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
         (void)server;
         g_connected = true;
+        appSeen();   // attach butuh waktu sebelum ping pertama
         Serial.printf("[BLE] Connected: %s\n", info.getAddress().toString().c_str());
         BLE_UpdateAdvertising(g_adv_stage, (g_adv_flags & 0x80) != 0);
     }
@@ -46,6 +55,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 class ConfigCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
         (void)info;
+        appSeen();
         if (g_cb.onConfig) g_cb.onConfig(c->getValue().c_str());
     }
 };
@@ -53,6 +63,7 @@ class ConfigCallbacks : public NimBLECharacteristicCallbacks {
 class CommandCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
         (void)info;
+        appSeen();
         if (g_cb.onCommand) g_cb.onCommand(c->getValue().c_str());
     }
 };
@@ -61,6 +72,7 @@ class CommandCallbacks : public NimBLECharacteristicCallbacks {
 class BufferCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
         (void)info;
+        appSeen();
         JsonDocument doc;
         if (deserializeJson(doc, c->getValue().c_str())) return;
         const char *cmd = doc["cmd"] | "";
@@ -121,10 +133,16 @@ void BLE_Init(const BandCallbacks &cb) {
 
 bool BLE_Connected() { return g_connected; }
 
+bool BLE_AppAlive() {
+    return g_connected && millis() - g_app_seen_ms < APP_TIMEOUT_MS;
+}
+
 // ─── §2.1 Siaran tahap eskalasi ──────────────────────────────
 
 void BLE_UpdateAdvertising(uint8_t stage, bool worn) {
-    uint8_t flags = (uint8_t)((worn ? 0x80 : 0x00) | (g_connected ? 0x01 : 0x00));
+    /* BLE_AppAlive, bukan g_connected. vitalsLoop memanggil ini tiap detik,
+     * jadi aplikasi yang berhenti ping terlihat di siaran ≤ 31 detik. */
+    uint8_t flags = (uint8_t)((worn ? 0x80 : 0x00) | (BLE_AppAlive() ? 0x01 : 0x00));
     if (stage == g_adv_stage && flags == g_adv_flags) return;
     g_adv_stage = stage;
     g_adv_flags = flags;

@@ -18,6 +18,9 @@ struct BandCallbacks {
 
 void BLE_Init(const BandCallbacks &cb);
 bool BLE_Connected();
+/* §2.1. Tersambung dan menulis sesuatu dalam 30 detik terakhir. Koneksi
+ * saja tidak cukup — Android membekukan aplikasi tapi membiarkan GATT. */
+bool BLE_AppAlive();
 
 void BLE_NotifyVitals(const uint8_t *packet, uint16_t len);        // §3.1
 void BLE_NotifyOxygen(uint8_t spo2_pct, uint8_t position);         // §3.2

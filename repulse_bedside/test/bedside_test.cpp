@@ -110,6 +110,34 @@ static void test_sunset_kills_blue() {
     assert(sunrise.b > sunset.b);
 }
 
+/* §4.3 light.rgb: warna pilihan dipakai persis, darurat tidak ikut. */
+static void test_custom_colour() {
+    Rgb pick = { 200, 40, 120 };
+    Rgb c = light_color("sunset", 2200, 255, &pick);
+    assert(c.r == 200 && c.g == 40 && c.b == 120);   // biru tidak dipotong
+
+    Rgb half = light_color("sunset", 2200, 128, &pick);
+    assert(half.r == 100);                            // kecerahan tetap berlaku
+
+    Rgb alert = light_color("alert", 6500, 255, &pick);
+    assert(alert.r == 255 && alert.g == 255 && alert.b == 255);
+
+    Rgb off = light_color("off", 2200, 255, &pick);
+    assert(off.r == 0 && off.g == 0 && off.b == 0);
+}
+
+/* Sunset mulai terang dan berakhir gelap — bukan sebaliknya. */
+static void test_sunset_dims_to_dark() {
+    LightRamp s = light_endpoints("sunset", 0, 40, 1500);
+    assert(s.from == 40 && s.to == 0);
+
+    LightRamp r = light_endpoints("sunrise", 0, 40, 1500);
+    assert(r.from == 0 && r.to == 40);
+
+    LightRamp now = light_endpoints("sunset", 10, 40, 0);   // tanpa ramp: langsung
+    assert(now.from == 10 && now.to == 40);
+}
+
 int main() {
     test_steady_noise_is_not_snoring();
     test_breathing_rhythm_is_snoring();
@@ -119,6 +147,8 @@ int main() {
     test_aroma_nightly_cap();
     test_dimming_is_exponential();
     test_sunset_kills_blue();
+    test_custom_colour();
+    test_sunset_dims_to_dark();
     printf("snore + aroma + light: semua cek lulus\n");
     return 0;
 }
