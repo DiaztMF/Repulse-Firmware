@@ -162,13 +162,21 @@ di atas PCB biru biasanya sudah membawanya.
 
 | ESP32-C3 | Strip |
 |---|---|
-| GPIO8 | DIN, **dengan pull-up 10 kΩ ke 3V3** |
+| GPIO3 | DIN, **tanpa pull-up** (boleh pull-down 10 kΩ ke GND) |
 | — | 5 V dari catu daya, **bukan dari ESP32** |
 | GND | GND bersama |
 
-⚠ **GPIO8 adalah strapping pin.** Pull-up 10 kΩ itu bukan opsional — tanpa
-itu, pin mengambang saat boot dan papan bisa boot berbeda tergantung modul
-mana yang menyala duluan.
+⚠ **DIN pindah dari GPIO8 ke GPIO3, dan pull-up 10 kΩ-nya DICABUT.**
+
+GPIO8 strapping pin: ia menuntut pull-up supaya papan boot normal, dan
+pull-up itu menahan DIN HIGH selama reset. WS2812 hanya menghapus frame-nya
+kalau DIN LOW lebih dari 50 µs, jadi warna lama bertahan sejak kabel
+dicolok. Dua syarat yang saling meniadakan di satu kaki. GPIO3 tidak
+menuntut apa pun dan kosong sejak DFPlayer pindah ke papan kedua.
+
+Kalau pindah pin belum menolong, tersangka berikutnya level tegangan:
+**data 3,3 V ke strip 5 V itu marginal** (WS2812 minta 0,7 × VDD = 3,5 V).
+Flash `sensor_ws2812` untuk mengujinya tanpa BLE dan tanpa sensor.
 
 Dua hal lain soal daya:
 - **Data 3,3 V ke strip 5 V itu marginal.** Beri strip 4,5 V, atau pasang
@@ -179,10 +187,15 @@ Dua hal lain soal daya:
 
 ### DFPlayer Mini (white noise & sirene)
 
-| DFPlayer | ke ESP32-C3 |
+Ada di **ESP32-C3 kedua** (sketsa `repulse_audio`), bukan di bedside.
+Bedside menyetirnya lewat ESP-NOW — tidak ada kabel di antara kedua papan
+selain GND bersama kalau keduanya berbagi catu daya.
+
+| DFPlayer | ke ESP32-C3 **#2** |
 |---|---|
-| **TX** (kaki 3) | **GPIO2** |
-| **RX** (kaki 2) | **GPIO3**, lewat **resistor 1 kΩ** seri |
+| **TX** (kaki 3) | **GPIO5** |
+| **RX** (kaki 2) | **GPIO4**, lewat **resistor 1 kΩ** seri |
+| **BUSY** (kaki 16) | **GPIO6** — wajib, tanpa ini trek tidak pernah diulang |
 | VCC (kaki 1) | **5 V**, bukan 3,3 V |
 | GND (kaki 7 atau 10) | GND bersama ESP32 |
 | SPK_1 / SPK_2 | speaker 3 W 4 Ω |
@@ -239,13 +252,13 @@ dengan relay ini.
 | GPIO | Dipakai untuk |
 |---|---|
 | 1 | BH1750 SDA |
-| 2 | DFPlayer TX → ESP RX · *strapping, pull-up 10 kΩ* |
-| 3 | DFPlayer RX ← ESP TX, lewat 1 kΩ |
+| 2 | — *strapping, biarkan kosong* |
+| 3 | WS2812 DIN |
 | 4 | Mikrofon WS |
 | 5 | Mikrofon SCK |
 | 6 | Mikrofon SD |
 | 7 | BH1750 SCL |
-| 8 | WS2812 DIN · *strapping, pull-up 10 kΩ* |
+| 8 | — *strapping, biarkan kosong* |
 | 9 | — *strapping, biarkan kosong* |
 | 10 | DHT11 DATA, pull-up 10 kΩ |
 | 20 | Relay aroma — bebas hanya karena log lewat USB, lihat catatan |
@@ -256,8 +269,9 @@ dengan relay ini.
 
 1. Semua GND menyatu — modul, catu daya, dan ESP32.
 2. GPIO9 kosong di kedua papan.
-3. Pull-up 10 kΩ terpasang di GPIO2 dan GPIO8 bedside.
-4. DFPlayer menyilang: TX-nya ke GPIO2, RX-nya ke GPIO3.
+3. GPIO2 dan GPIO8 bedside kosong — **tidak ada pull-up di jalur WS2812**.
+4. DFPlayer ada di papan KEDUA (ESP32-C3 #2), bukan di bedside — lihat
+   bagian DFPlayer di bawah.
 5. DFPlayer dapat 5 V, bukan 3,3 V.
 6. `AD0` MPU6050 ke GND.
 7. `L/R` INMP441 ke GND, `ADDR` BH1750 ke GND.

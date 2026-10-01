@@ -1,6 +1,6 @@
 /*
  * ═══════════════════════════════════════════════════════════════
- *  RePulse Bedside — ESP32-C3
+ *  RePulse Bedside — ESP32 DevKit V1 (WROOM-32)
  * ═══════════════════════════════════════════════════════════════
  *
  *  Peran: bedside adalah "RePulse Bedside" di BLE_GATT_CONTRACT.md §4.
@@ -11,7 +11,7 @@
  *
  *  Sensor  : BH1750 (lux), DHT11 (suhu/RH), INMP441 (mikrofon I2S)
  *  Aktuator: WS2812 (lampu), DFPlayer Mini (white noise + sirene),
- *            diffuser aroma lewat modul relay di GPIO20 (lihat PIN_AROMA)
+ *            diffuser aroma lewat modul relay di GPIO27 (lihat PIN_AROMA)
  *
  *  Library (Arduino Library Manager):
  *    1. NimBLE-Arduino  >= 2.0   — h2zero
@@ -21,7 +21,8 @@
  *    5. Adafruit NeoPixel        — Adafruit
  *    6. DFRobotDFPlayerMini      — DFRobot
  *
- *  Board: ESP32C3 Dev Module — USB CDC On Boot WAJIB Enabled
+ *  Board: ESP32 Dev Module. Serial kembali ke UART0 (pin 1/3) — papan ini
+ *  tidak punya setelan USB CDC On Boot, dan tidak memerlukannya.
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -49,67 +50,52 @@
  * satu bit sah pun. Gejalanya nol mutlak di setiap sampel, sama persis
  * dengan kabel putus, dan keempat pemeriksaan kabel lolos karena memang
  * semuanya tersambung — hanya ke lubang yang salah. */
-#define PIN_MIC_BCLK       5    // INMP441 SCK
-#define PIN_MIC_WS         4    // INMP441 WS / LRCK
-#define PIN_MIC_DIN        6    // INMP441 SD / DOUT
+#define PIN_MIC_BCLK      26    // INMP441 SCK
+#define PIN_MIC_WS        25    // INMP441 WS / LRCK
+#define PIN_MIC_DIN       33    // INMP441 SD / DOUT
+                                // L/R INMP441 ke GND — kanal kiri, sesuai SLOT_MODE_MONO
 
-#define PIN_I2C_SCL        7    // BH1750
-#define PIN_I2C_SDA        1    // BH1750 — dipindah dari GPIO9 (strapping), lihat catatan bawah
+#define PIN_I2C_SCL       22    // BH1750 — I2C default DevKit V1
+#define PIN_I2C_SDA       21    // BH1750
 
-#define PIN_LED            8    // WS2812 DIN — strapping pin, lihat catatan
-#define PIN_DHT           10     // DHT11 DATA, pull-up 10k ke 3V3
+#define PIN_LED           13    // WS2812 DIN
+#define PIN_DHT            4    // DHT11 DATA, pull-up 10k ke 3V3
 
-#define PIN_DFPLAYER_RX    2    // ke TX DFPlayer
-#define PIN_DFPLAYER_TX    3    // ke RX DFPlayer, lewat resistor 1k
+#define PIN_DFPLAYER_RX   16    // RX2 — ke TX DFPlayer
+#define PIN_DFPLAYER_TX   17    // TX2 — ke RX DFPlayer, lewat resistor 1k
 
-/* -1 = diffuser tidak punya pin kendali, sesuai keputusan 19 Agustus 2026.
- * Perintah `aroma` dibalas status = 1 (gagal), bukan status = 0 — firmware
- * tidak boleh melapor "selesai" untuk sesuatu yang tidak pernah ia jalankan.
- *
- * ⚠ Konsekuensi keselamatan yang perlu dicatat: diffuser yang dicolok
- * langsung ke 5V menyala sepanjang malam. Justru itu yang dilarang §4.3 —
- * ruangan jadi lembap dan berisiko mengiritasi saluran napas. Selama belum
- * ada MOSFET/relay, cabut diffusernya saat tidur.
- *
- * Sekarang ADA: modul relay di GPIO20.
- *
- * ⚠ GPIO20 adalah U0RXD — kaki RX UART0 bawaan ESP32-C3. Aman dipakai di
- * sini hanya karena CDCOnBoot=cdc memindahkan Serial ke USB, jadi UART0
- * tidak dipakai untuk log. Tapi ROM bootloader tetap menyentuh pasangan
- * 20/21 sesaat setelah reset, dan di jendela itu pin kita belum jadi
- * OUTPUT — ia mengambang. Modul relay aktif-LOW membaca kaki mengambang
- * sebagai LOW dan menyalakan diffuser di setiap boot. Karena itu level
- * mati DITULIS SEBELUM pinMode() di setup(), supaya latch keluarannya
- * sudah benar pada detik pin itu menjadi keluaran.
+/* Relay diffuser aroma.
  *
  * AROMA_ACTIVE_LEVEL — DIUKUR, bukan diasumsikan. Modul relay yang beredar
- * kebanyakan aktif LOW dan itulah yang kutebak semula; modul di meja ini
- * ternyata aktif HIGH. Gejalanya tegas dan tidak bisa disalahartikan:
- * relay menyala saat boot, lalu MATI ketika perintah aroma dikirim — tepat
- * kebalikan dari yang seharusnya.
+ * kebanyakan aktif LOW dan itulah tebakan semula; modul di meja ini ternyata
+ * aktif HIGH. Gejalanya tegas: relay menyala saat boot, lalu MATI ketika
+ * perintah aroma dikirim — tepat kebalikan dari yang seharusnya. Kalau kelak
+ * modulnya diganti dan gejala itu muncul lagi, baliklah define ini dan tidak
+ * ada lagi yang perlu disentuh. Salah polaritas di sini bukan ketidaknyamanan:
+ * PRD §4.3 melarang diffuser menyala terus-menerus karena risikonya nyata bagi
+ * penderita asma, dan polaritas terbalik berarti diffuser menyala sepanjang
+ * malam kecuali seseorang memerintahkannya.
  *
- * Kalau kelak modulnya diganti dan gejala itu muncul lagi, baliklah define
- * ini dan tidak ada lagi yang perlu disentuh. Salah polaritas di sini bukan
- * ketidaknyamanan: §4.3 melarang diffuser menyala terus-menerus karena
- * risikonya nyata bagi penderita asma, dan polaritas terbalik berarti
- * diffuser menyala sepanjang malam kecuali seseorang memerintahkannya. */
-#define PIN_AROMA         20
+ * GPIO27 bukan strapping dan bukan kaki UART — beda dengan GPIO20 di ESP32-C3
+ * yang U0RXD dan mengambang sesaat setelah reset, cukup lama untuk menyalakan
+ * relay aktif-LOW di setiap boot. Urutan "tulis latch dulu, baru pinMode()" di
+ * setup() tetap dipertahankan: harganya nol dan tetap benar. */
+#define PIN_AROMA         27
 #define AROMA_ACTIVE_LEVEL HIGH
 
-/* ⚠ CATATAN STRAPPING PIN ESP32-C3: GPIO2, GPIO8, dan GPIO9 ikut menentukan
- * mode boot.
+/* ⚠ CATATAN PIN ESP32 DevKit V1 (WROOM-32, 30 pin):
  *
- * GPIO9 sengaja DIKOSONGKAN. SDA BH1750 dulu di sini dengan anggapan pull-up
- * modul menahannya HIGH — sampai suatu hari papan diam total: LED biru mati,
- * serial kosong, padahal papan tanpa sensor dengan kode yang sama normal.
- * esptool tersambung tanpa reset dan GPIO_STRAP_REG (0x60004038) terbaca
- * 0x5: bit 3 = GPIO9 = 0, chip masuk mode download. Modul yang VCC-nya
- * kendor atau rusak menarik SDA ke GND, dan tidak ada satu baris kode pun
- * yang sempat jalan untuk melaporkannya. GPIO1 bukan strapping pin.
+ *   GPIO6–11   tersambung ke flash SPI — papan tidak akan boot.
+ *   GPIO34/35/36/39  input-only, tidak punya driver keluaran.
+ *   GPIO1/3    UART0 = Serial. Di ESP32-C3 log pindah ke USB-CDC sehingga
+ *              UART0 bebas dipakai; di sini TIDAK — log kembali ke pin 1/3.
+ *   GPIO0/2/5/12/15  strapping. GPIO12 (MTDI) harus LOW saat boot; HIGH
+ *              menyetel flash ke 1,8V dan papan gagal menyala.
  *
- * GPIO8 (WS2812 DIN) dan GPIO2 (RX dari DFPlayer) mengambang saat boot — pasang
- * resistor pull-up 10k ke 3V3 di keduanya, supaya papan tidak gagal boot
- * tergantung modul mana yang menyala lebih dulu. */
+ * Tidak satu pun dipakai tabel di atas, jadi tidak ada lagi pull-up boot yang
+ * wajib — berbeda dari versi C3 yang menuntut pull-up 10k di DIN WS2812 dan
+ * di jalur RX DFPlayer. Pull-up 10k di DATA DHT11 tetap perlu; itu syarat
+ * protokol 1-wire-nya, bukan urusan strapping. */
 
 // ═══════════════════════════════════════════════════════════════
 //  KNOB KALIBRASI
@@ -181,7 +167,10 @@ static BH1750             lightMeter;
 static DHT                dht(PIN_DHT, DHT11);
 static Adafruit_NeoPixel  strip(LED_COUNT, PIN_LED, NEO_GRB + NEO_KHZ800);
 static DFRobotDFPlayerMini dfplayer;
-static HardwareSerial     DfSerial(1);
+/* UART2. UART1 default-nya menempel di kaki flash (GPIO9/10) pada WROOM-32;
+ * begin() memang menimpa pinnya, tapi 16/17 memang jatah UART2 dan tidak ada
+ * alasan meminjam periferal yang bertetangga dengan flash. */
+static HardwareSerial     DfSerial(2);
 static I2SClass           i2s;
 
 static SnoreDetector snore;
@@ -345,8 +334,8 @@ static bool     noiseStopAtEnd = false;
  * Jadi pengulangannya dipegang firmware, bukan modul, lewat dua jalur:
  *
  *   Pesan trek-selesai. Bersih dan tepat waktu, tapi hanya ada kalau kaki TX
- *   modul benar-benar sampai ke GPIO2 — dan sepanjang satu malam ternyata
- *   tidak, karena GND-nya tidak pernah mencapai papan.
+ *   modul benar-benar sampai ke PIN_DFPLAYER_RX — dan sepanjang satu malam
+ *   ternyata tidak, karena GND-nya tidak pernah mencapai papan.
  *
  *   Pengawas waktu. Kasar, tapi tetap bekerja pada modul yang sama sekali
  *   bisu. Ia yang menjaga janji §6.3 kalau jalur balik itu putus lagi. */
@@ -833,12 +822,14 @@ static void roomLoop() {
 
 void setup() {
     Serial.begin(115200);
-    /* Sama seperti di gelang: port USB-CDC baru muncul di PC satu sampai
-     * dua detik setelah reset, jadi delay(300) membuang seluruh banner boot
-     * — termasuk baris TIDAK DITEMUKAN yang justru paling ingin kamu baca
-     * saat menelusuri sensor yang belum terpasang. */
+    /* Di ESP32-C3 log lewat USB-CDC: port baru muncul di PC satu sampai dua
+     * detik setelah reset, dan tanpa penantian ini seluruh banner boot hilang
+     * — termasuk baris TIDAK DITEMUKAN yang justru paling ingin kamu baca.
+     * Di WROOM-32 Serial adalah UART0 lewat chip USB-UART: siap seketika,
+     * `!Serial` langsung false, dan baris ini lewat tanpa menunggu. Dibiarkan
+     * supaya berkas yang sama tetap benar di kedua papan. */
     for (uint32_t t0 = millis(); !Serial && millis() - t0 < 2000; ) delay(10);
-    Serial.println(F("\n=== RePulse Bedside (ESP32-C3) ==="));
+    Serial.println(F("\n=== RePulse Bedside (ESP32 DevKit V1) ==="));
 
     if (PIN_AROMA >= 0) {
         /* Urutannya penting: latch keluaran diisi dulu, baru pin dijadikan
@@ -859,9 +850,11 @@ void setup() {
 
     /* Level jalur SEBELUM Wire mengambilnya. Pull-up di modul BH1750 harus
      * menahan keduanya HIGH; LOW berarti VCC modul tidak sampai, modul rusak,
-     * atau kabel menyentuh GND — kegagalan yang dulu menjebak papan di mode
-     * download saat SDA masih di GPIO9. "TIDAK DITEMUKAN" saja tidak bisa
-     * membedakan itu dari alamat yang salah. */
+     * atau kabel menyentuh GND. "TIDAK DITEMUKAN" saja tidak bisa membedakan
+     * itu dari alamat yang salah. Di papan C3 kegagalan yang sama pernah
+     * menjebak papan di mode download karena SDA duduk di GPIO9, strapping
+     * pin; di sini GPIO21 tidak strapping, jadi yang tersisa hanya sensor
+     * yang sunyi — dan baris ini yang menjelaskan kenapa. */
     pinMode(PIN_I2C_SDA, INPUT);
     pinMode(PIN_I2C_SCL, INPUT);
     delay(5);
